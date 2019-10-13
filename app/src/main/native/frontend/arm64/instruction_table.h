@@ -18,7 +18,12 @@ namespace Instruction {
         enum InstrTypeA64 {
             Invalid,
             Unallocated,
-            DataprocessingImmediate,
+            AddSubImmediate,
+            MovWide,
+            PCRelAdr,
+            LogicalImmediate,
+            BitField,
+            Extract,
             Branches,
             ExpGen,
             System,
@@ -33,7 +38,7 @@ namespace Instruction {
             UN_DECODED,
             INVALID,
 
-#include "opcodes_table.inl"
+#include "instructions_table.inl"
 
             NUM_INSTRUCTIONS,
         };

@@ -8,6 +8,9 @@ include_directories(.)
 
 include_directories(externals/ext-boost)
 
+add_subdirectory(externals/vixl)
+include_directories(externals/vixl)
+
 add_library(virtual_arm SHARED
         virtual_arm.cc
         base/marcos.cc
@@ -25,13 +28,17 @@ add_library(virtual_arm SHARED
         frontend/ir/instruction_ir.cc
         frontend/ir/block_ir.cc
         frontend/ir/assembler_ir.cc
-        frontend/arm64/ir_adapter_a64.cc
+        frontend/arm64/ir_for_a64.cc
         asm/arm64/assembler_a64.cc
         backend/arm64/trampoline_a64.cc
         backend/arm64/trampoline.S
         backend/ir/interpreter_ir.cc
         block/code_block.cc
+        dbi/arm64/dbi_arm64.cc
+        dbi/arm64/dbi_visitor_arm64.cc
+        dbi/arm64/dbi_context_arm64.cc
 )
 
 
 target_link_libraries(virtual_arm android log)
+target_link_libraries(virtual_arm vixl)

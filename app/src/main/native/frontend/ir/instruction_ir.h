@@ -8,6 +8,7 @@
 #include "opcode_ir.h"
 #include "argument_ir.h"
 #include <boost/intrusive/slist_hook.hpp>
+#include <externals/ext-boost/boost/intrusive/slist.hpp>
 
 namespace Instruction::IR {
 
@@ -22,9 +23,9 @@ namespace Instruction::IR {
 
         InstrIR(OpcodeIR opcode, size_t useCount, const std::array<Argument, max_arg_count> &args);
 
-        void SetArg(int pos, Argument &argument);
+        void SetArg(int pos, const Argument &argument);
 
-        OpcodeIR opcode_;
+        u8 opcode_;
         u32 use_count = 0;
         std::array<Argument, max_arg_count> args_;
         Return return_;
@@ -32,8 +33,15 @@ namespace Instruction::IR {
 
     class InstrIRPool {
     public:
-        static InstrIR &Acquire();
-        static void Release(InstrIR &instr);
+
+        static InstrIRPool &Get();
+
+        InstrIR &Acquire();
+        void Release(InstrIR &instr);
+
+    private:
+        std::mutex pool_lock_;
+        slist<InstrIR, cache_last<true>> free_list_;
     };
 
 }

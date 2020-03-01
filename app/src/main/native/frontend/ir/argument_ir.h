@@ -23,6 +23,8 @@ namespace Instruction::IR {
             Cond,
             RegisterFromRet,
             RegisterFronted,
+            RegisterState,
+            StateFromRet,
             Imme,
             RetValue,
             Shift,
@@ -65,23 +67,23 @@ namespace Instruction::IR {
         }
 
 
-        Type ArgType() {
+        Type ArgType() const {
             return Unknown;
         };
 
-        FORCE_INLINE bool IsCond() {
+        FORCE_INLINE bool IsCond() const {
             return ArgType() == Cond;
         }
 
-        FORCE_INLINE bool IsUnknown() {
+        FORCE_INLINE bool IsUnknown() const {
             return ArgType() == Unknown;
         }
 
-        FORCE_INLINE bool IsFrontedReg() {
+        FORCE_INLINE bool IsFrontedReg() const {
             return ArgType() == RegisterFronted;
         }
 
-        FORCE_INLINE bool IsImm() {
+        FORCE_INLINE bool IsImm() const {
             return ArgType() == Imme;
         }
 
@@ -124,10 +126,19 @@ namespace Instruction::IR {
         }
     };
 
+    class State : public Argument {
+    public:
+        State() = default;
+        State(Return &ret) : Argument(ret.instr) {
+            type_ = StateFromRet;
+        }
+    };
+
 
     template<DataSize data_size>
     class RegisterIR : public Argument {
     public:
+
         RegisterIR() = default;
 
         RegisterIR(FrontedReg &reg) : Argument(reg) {
@@ -137,8 +148,12 @@ namespace Instruction::IR {
         RegisterIR(ReturnType<data_size> &ret) : Argument(ret.instr) {
             size_ = data_size;
         }
-    };
 
+        RegisterIR(State &state) : Argument(state.value_.instr) {
+            size_ = data_size;
+            type_ = RegisterState;
+        }
+    };
 
     template<typename D>
     class Imm : public Argument {
@@ -171,6 +186,7 @@ namespace Instruction::IR {
     using RegAny = RegisterIR<
             DataSize::U1 | DataSize::U8 | DataSize::U16 | DataSize::U32 | DataSize::U64 |
             DataSize::U128>;
+    using RegAddr = RegisterIR<DataSize(sizeof(VAddr) * 8)>;
 
     using Imm1 = Imm<bool>;
     using Imm8 = Imm<u8>;

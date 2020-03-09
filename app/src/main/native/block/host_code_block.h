@@ -37,12 +37,14 @@ namespace Code {
 
         BaseBlock(VAddr start, VAddr size);
 
+        VAddr GetBufferStart(u16 id);
         VAddr GetBufferStart(Buffer &buffer);
         VAddr GetBufferEnd(Buffer &buffer);
 
         Buffer &GetBuffer(u16 id);
 
         virtual Buffer &AllocCodeBuffer(VAddr source, u32 size);
+        void Align(u32 size);
         virtual bool SaveToDisk(std::string path);
     protected:
         VAddr start_;
@@ -56,25 +58,40 @@ namespace Code {
 
     namespace A64 {
 
+        /**
+         * 考虑到指令的可修改性
+         * 我们需要一个中间人来分发代码
+         * 当指令被修改时，我们生成新的指令，并且将分发表指向新指令缓存
+         * 直接修改旧缓存，当有其他线程还在执行时会引起不必要的错误
+         */
+
         struct Dispatcher {
             // B label
             u32 instr_direct_branch_;
         };
 
         struct DispatcherTable {
-            Dispatcher dispatchers_[MAX_BUFFER];
+            Dispatcher *dispatchers_;
         };
+
+#define BLOCK_SIZE_A64 16 * 1024 * 1024
 
         class CodeBlock : public BaseBlock {
         public:
-            CodeBlock();
+            CodeBlock(u32 block_size = BLOCK_SIZE_A64);
             virtual ~CodeBlock();
 
+            Buffer &AllocCodeBuffer(VAddr source, u32 size) override;
+
             void GenDispatcher(Buffer &buffer);
+            VAddr GetDispatcherAddr(Buffer &buffer);
 
         protected:
+            u32 dispatcher_count_;
             DispatcherTable *dispatcher_table_;
         };
+
+        using CodeBlockRef = SharedPtr<CodeBlock>;
 
     }
 

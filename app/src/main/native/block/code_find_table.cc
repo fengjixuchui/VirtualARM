@@ -3,5 +3,3 @@
 //
 
 #include "code_find_table.h"
-
-using namespace Code;

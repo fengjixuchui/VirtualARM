@@ -4,20 +4,117 @@
 
 #include <sys/mman.h>
 #include "dbi_context_arm64.h"
+#include "dbi_trampolines_arm64.h"
 
 using namespace DBI::A64;
 
-Context::Context(const Register &reg_ctx) : masm_{}, REG_CTX{reg_ctx} {
-    suspend_addr_ = static_cast<u64 *>(mmap(0, PAGE_SIZE, PROT_READ,
-                                            MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED,
-                                            -1, 0));
+static thread_local SharedPtr<Context> current_;
+
+LabelHolder::LabelHolder(MacroAssembler &masm) : masm_(masm) {}
+
+LabelHolder::~LabelHolder() {
+    for (auto label : labels_) {
+        delete label;
+    }
+}
+
+void LabelHolder::SetDestBuffer(VAddr addr) {
+    dest_buffer_start_ = addr;
+}
+
+Label *LabelHolder::AllocLabel() {
+    auto label = new Label();
+    labels_.push_back(label);
+    return label;
+}
+
+Label *LabelHolder::GetDispatcherLabel() {
+    return &dispatcher_label_;
+}
+
+Label *LabelHolder::GetPageLookupLabel() {
+    return &page_lookup_label_;
+}
+
+Label *LabelHolder::GetCallSvcLabel() {
+    return &call_svc_label_;
+}
+
+Label *LabelHolder::GetSpecLabel() {
+    return &spec_label_;
+}
+
+void LabelHolder::BindDispatcherTrampoline(VAddr addr) {
+    assert(dest_buffer_start_);
+    ptrdiff_t offset = dest_buffer_start_ - addr;
+    __ BindToOffset(&dispatcher_label_, offset);
+}
+
+void LabelHolder::BindPageLookupTrampoline(VAddr addr) {
+    assert(dest_buffer_start_);
+    ptrdiff_t offset = dest_buffer_start_ - addr;
+    __ BindToOffset(&page_lookup_label_, offset);
+}
+
+void LabelHolder::BindCallSvcTrampoline(VAddr addr) {
+    assert(dest_buffer_start_);
+    ptrdiff_t offset = dest_buffer_start_ - addr ;
+    __ BindToOffset(&call_svc_label_, offset);
+}
+
+void LabelHolder::BindSpecTrampoline(VAddr addr) {
+    assert(dest_buffer_start_);
+    ptrdiff_t offset = dest_buffer_start_ - addr;
+    __ BindToOffset(&spec_label_, offset);
+}
+
+Context::Context(const Register &reg_ctx, const Register &reg_forward)
+        : masm_{}, reg_ctx_{reg_ctx}, reg_forward_(reg_forward) {
+    suspend_addr_ = reinterpret_cast<u64>(static_cast<u64 *>(mmap(0, PAGE_SIZE, PROT_READ,
+                                                                  MAP_PRIVATE | MAP_ANONYMOUS |
+                                                                  MAP_FIXED,
+                                                                  -1, 0)));
+    context_.suspend_flag = suspend_addr_;
+    code_find_table_ = SharedPtr<FindTable<VAddr>>(new FindTable<VAddr>(48, 2));
+    current_ = this;
 }
 
 Context::~Context() {
-    munmap(suspend_addr_, PAGE_SIZE);
+    munmap(reinterpret_cast<void *>(suspend_addr_), PAGE_SIZE);
 }
 
-const CPU::A64::CPUContext &Context::GetContext() const {
+void Context::SetCodeCachePosition(VAddr addr) {
+    cursor_.origin_code_start_ = addr;
+    cursor_.label_holder_ = SharedPtr<LabelHolder>(new LabelHolder(masm_));
+}
+
+void Context::FlushCodeCache(CodeBlockRef block, bool bind_stub) {
+    assert(cursor_.origin_code_start_ > 0);
+    auto buffer = block->AllocCodeBuffer(cursor_.origin_code_start_,
+                                         static_cast<u32>(__ GetBuffer()->GetSizeInBytes()));
+    auto buffer_start = block->GetBufferStart(buffer);
+    if (bind_stub) {
+        cursor_.label_holder_->SetDestBuffer(buffer_start);
+        // Fill Trampolines addr
+        cursor_.label_holder_->BindDispatcherTrampoline(block->GetBufferStart(0));
+        cursor_.label_holder_->BindPageLookupTrampoline(block->GetBufferStart(1));
+        cursor_.label_holder_->BindCallSvcTrampoline(block->GetBufferStart(2));
+        cursor_.label_holder_->BindSpecTrampoline(block->GetBufferStart(3));
+    }
+    __ FinalizeCode();
+    std::memcpy(reinterpret_cast<void *>(buffer_start), __ GetBuffer()->GetStartAddress<void *>(),
+                __ GetBuffer()->GetSizeInBytes());
+    ClearCachePlatform(buffer_start, __ GetBuffer()->GetSizeInBytes());
+    code_find_table_->FillCodeAddress(cursor_.origin_code_start_, buffer_start);
+    __ Reset();
+    cursor_ = {};
+}
+
+SharedPtr<Context>& Context::Current() {
+    return current_;
+}
+
+const CPU::A64::CPUContext &Context::GetCPUContext() const {
     return context_;
 }
 
@@ -30,131 +127,351 @@ void Context::SetCurPc(VAddr cur_pc) {
 }
 
 void Context::SetSuspendFlag(bool suspend) {
-    mprotect(suspend_addr_, PAGE_SIZE, suspend ? PROT_NONE : PROT_READ);
+    mprotect(reinterpret_cast<void *>(suspend_addr_), PAGE_SIZE, suspend ? PROT_NONE : PROT_READ);
 }
 
-ContextNoMemTrace::ContextNoMemTrace() : Context(TMP1) {
+void Context::Emit(u32 instr) {
+    __ dci(instr);
+}
+
+Label *Context::Label() {
+    return cursor_.label_holder_->AllocLabel();
+}
+
+void Context::PushX(Register reg1, Register reg2) {
+    assert(reg1.GetCode() != reg_ctx_.GetCode() && reg2.GetCode() != reg_ctx_.GetCode());
+    if (reg2.GetCode() == NoReg.GetCode()) {
+        __ Str(reg1, MemOperand(reg_ctx_, OFFSET_CTX_A64_CPU_REG + reg1.GetCode() * 8));
+    } else {
+        if (reg2.GetCode() - reg1.GetCode() == 1 && reg2.GetCode() % 2 == 0) {
+            __ Stp(reg1, reg2, MemOperand(reg_ctx_, OFFSET_CTX_A64_CPU_REG + reg1.GetCode() * 8));
+        } else {
+            __ Str(reg1, MemOperand(reg_ctx_, OFFSET_CTX_A64_CPU_REG + reg1.GetCode() * 8));
+            __ Str(reg2, MemOperand(reg_ctx_, OFFSET_CTX_A64_CPU_REG + reg2.GetCode() * 8));
+        }
+    }
+}
+
+void Context::PopX(Register reg1, Register reg2) {
+    assert(reg1.GetCode() != reg_ctx_.GetCode() && reg2.GetCode() != reg_ctx_.GetCode());
+    if (reg2.GetCode() == NoReg.GetCode()) {
+        __ Ldr(reg1, MemOperand(reg_ctx_, OFFSET_CTX_A64_CPU_REG + reg1.GetCode() * 8));
+    } else {
+        if (reg2.GetCode() - reg1.GetCode() == 1 && reg2.GetCode() % 2 == 0) {
+            __ Ldp(reg1, reg2, MemOperand(reg_ctx_, OFFSET_CTX_A64_CPU_REG + reg1.GetCode() * 8));
+        } else {
+            __ Ldr(reg1, MemOperand(reg_ctx_, OFFSET_CTX_A64_CPU_REG + reg1.GetCode() * 8));
+            __ Ldr(reg2, MemOperand(reg_ctx_, OFFSET_CTX_A64_CPU_REG + reg2.GetCode() * 8));
+        }
+    }
+}
+
+void Context::CheckSuspend(Register tmp) {
+    __ Ldr(tmp, MemOperand(reg_ctx_, OFFSET_CTX_A64_SUSPEND_ADDR));
+    // if suspend, trigger 11 signal
+    __ Ldr(tmp, MemOperand(TMP0));
+}
+
+void Context::SavePc(VAddr pc, Register tmp) {
+    __ Mov(tmp, pc);
+    __ Str(tmp, MemOperand(reg_ctx_, OFFSET_CTX_A64_PC));
+}
+
+void Context::LoadFromContext(Register rt, VAddr offset) {
+    if (reg_ctx_.GetCode() == rt.GetCode()) {
+        auto wrap = [this, rt, offset](std::array<Register, 1> tmp) -> void {
+            __ Ldr(tmp[0], MemOperand(reg_ctx_, offset));
+            __ Str(tmp[0], MemOperand(reg_ctx_, OFFSET_CTX_A64_CPU_REG + rt.GetCode() * 8));
+        };
+        WrapContext<1>(wrap, {rt});
+    } else {
+        auto wrap = [this, rt, offset](std::array<Register, 0> tmp) -> void {
+            __ Ldr(rt, MemOperand(reg_ctx_, offset));
+        };
+        WrapContext<0>(wrap, {rt});
+    }
+}
+
+void Context::ReadTPIDR(u8 target) {
+    LoadFromContext(XRegister::GetXRegFromCode(target), OFFSET_CTX_A64_TPIDR);
+}
+
+void Context::ReadTPIDRRO(u8 target) {
+    LoadFromContext(XRegister::GetXRegFromCode(target), OFFSET_CTX_A64_TPIDRRO);
+}
+
+void Context::FindForwardTarget(u8 reg_target) {
+    auto rt = XRegister::GetXRegFromCode(reg_target);
+    auto wrap = [this, rt](std::array<Register, 2> tmp) -> void {
+        auto *miss_target = Label();
+        auto *label_loop = Label();
+        auto *label_end = Label();
+        auto *gen_code = cursor_.label_holder_->GetDispatcherLabel();
+        // Find hash table
+        __ Ldr(tmp[0], MemOperand(reg_ctx_, OFFSET_CTX_A64_DISPATCHER_TABLE));
+        __ Mov(tmp[1], Operand(rt, LSR, CODE_CACHE_HASH_BITS));
+        __ Bfc(tmp[1], code_find_table_->TableBits(),
+               sizeof(VAddr) * 8 - code_find_table_->TableBits());
+        __ Ldr(tmp[0], MemOperand(tmp[0], tmp[1], LSL, 3));
+        __ Cbz(tmp[0], miss_target);
+        __ And(tmp[1], rt, (CODE_CACHE_HASH_SIZE - CODE_CACHE_HASH_OVERP) << 2);
+        // 2 + 2 = 4 = 16字节 = Entry 大小
+        __ Adds(tmp[0], tmp[0], Operand(tmp[1], LSL, 2));
+        __ Bind(label_loop);
+        __ Ldr(tmp[1], MemOperand(tmp[0], 16, PostIndex));
+        __ Cbz(tmp[1], miss_target);
+        __ Sub(tmp[1], tmp[1], rt);
+        __ Cbnz(tmp[1], label_loop);
+        // find target
+        __ Ldr(rt, MemOperand(tmp[0], -8, PreIndex));
+        __ B(label_end);
+        // can not found table
+        __ Bind(miss_target);
+        __ Str(rt, MemOperand(reg_ctx_, OFFSET_CTX_A64_FORWARD));
+        PopX<2>(tmp);
+        PushX(lr);
+        __ Bl(gen_code);
+        PopX(lr);
+        __ Ldr(rt, MemOperand(reg_ctx_, OFFSET_CTX_A64_FORWARD));
+        __ Bind(label_end);
+    };
+    WrapContext<2>(wrap, {rt});
+}
+
+void Context::FindForwardTarget(VAddr const_target) {
+}
+
+void Context::SaveContextFull(bool protect_lr) {
+    auto wrap = [this, protect_lr](std::array<Register, 1> tmp) -> void {
+        // XRegs
+        for (int i = 0; i < 30; i += 2) {
+            if (i == reg_ctx_.GetCode()) {
+                __ Str(XRegister::GetXRegFromCode(i),
+                       MemOperand(reg_ctx_, 8 * i));
+            } else if (i + 1 == reg_ctx_.GetCode()) {
+                __ Str(XRegister::GetXRegFromCode(i + 1),
+                       MemOperand(reg_ctx_, 8 * (i + 1)));
+            } else {
+                __ Stp(XRegister::GetXRegFromCode(i), XRegister::GetXRegFromCode(i + 1),
+                       MemOperand(reg_ctx_, 8 * i));
+            }
+        }
+        // lr
+        if (reg_ctx_.GetCode() != 30) {
+            __ Str(x30, MemOperand(reg_ctx_, protect_lr ? 8 * 30 : OFFSET_CTX_A64_TMP_LR));
+        }
+        // Sysregs
+        __ Mrs(tmp[0], NZCV);
+        __ Str(tmp[0].W(), MemOperand(reg_ctx_, OFFSET_CTX_A64_PSTATE));
+        __ Mrs(tmp[0], FPCR);
+        __ Str(tmp[0].W(), MemOperand(reg_ctx_, OFFSET_CTX_A64_FPCR));
+        __ Mrs(tmp[0], FPSR);
+        __ Str(tmp[0].W(), MemOperand(reg_ctx_, OFFSET_CTX_A64_FPSR));
+        // Sp
+        __ Str(sp, MemOperand(reg_ctx_, OFFSET_CTX_A64_SP));
+        // Pc
+        __ Mov(tmp[0], cur_pc_);
+        __ Str(tmp[0], MemOperand(reg_ctx_, OFFSET_CTX_A64_PC));
+        // VRegs
+        __ Add(tmp[0], reg_ctx_, OFFSET_CTX_A64_VEC_REG);
+        for (int i = 0; i < 32; i += 2) {
+            __ Stp(VRegister::GetVRegFromCode(i), VRegister::GetVRegFromCode(i + 1),
+                   MemOperand(tmp[0], 16 * i));
+        }
+    };
+    WrapContext<1>(wrap);
+}
+
+void Context::RestoreContextFull(bool protect_lr) {
+    auto wrap = [this, protect_lr](std::array<Register, 1> tmp) -> void {
+        // XRegs
+        for (int i = 0; i < 30; i += 2) {
+            if (i == reg_ctx_.GetCode()) {
+                __ Ldr(XRegister::GetXRegFromCode(i),
+                       MemOperand(reg_ctx_, 8 * i));
+            } else if (i + 1 == reg_ctx_.GetCode()) {
+                __ Ldr(XRegister::GetXRegFromCode(i + 1),
+                       MemOperand(reg_ctx_, 8 * (i + 1)));
+            } else {
+                __ Ldp(XRegister::GetXRegFromCode(i), XRegister::GetXRegFromCode(i + 1),
+                       MemOperand(reg_ctx_, 8 * i));
+            }
+        }
+        // lr
+        if (reg_ctx_.GetCode() != 30) {
+            __ Ldr(x30, MemOperand(reg_ctx_, protect_lr ? 8 * 30 : OFFSET_CTX_A64_TMP_LR));
+        }
+        // Sysregs
+        __ Ldr(tmp[0].W(), MemOperand(reg_ctx_, OFFSET_CTX_A64_PSTATE));
+        __ Msr(NZCV, tmp[0]);
+        __ Ldr(tmp[0].W(), MemOperand(reg_ctx_, OFFSET_CTX_A64_FPCR));
+        __ Msr(FPCR, tmp[0]);
+        __ Ldr(tmp[0].W(), MemOperand(reg_ctx_, OFFSET_CTX_A64_FPSR));
+        __ Msr(FPSR, tmp[0]);
+        // Sp
+        __ Ldr(sp, MemOperand(reg_ctx_, OFFSET_CTX_A64_SP));
+        // VRegs
+        __ Add(tmp[0], reg_ctx_, OFFSET_CTX_A64_VEC_REG);
+        for (int i = 0; i < 32; i += 2) {
+            __ Ldp(VRegister::GetVRegFromCode(i), VRegister::GetVRegFromCode(i + 1),
+                   MemOperand(tmp[0], 16 * i));
+        }
+    };
+    WrapContext<1>(wrap);
+}
+
+void Context::SaveContextCallerSaved(bool protect_lr) {
+    auto wrap = [this, protect_lr](std::array<Register, 1> tmp) -> void {
+        // XRegs
+        // x0 - x18
+        for (int i = 0; i < 19; i += 2) {
+            if (i == reg_ctx_.GetCode()) {
+                __ Str(XRegister::GetXRegFromCode(i),
+                       MemOperand(reg_ctx_, 16 * i));
+            } else if (i + 1 == reg_ctx_.GetCode()) {
+                __ Str(XRegister::GetXRegFromCode(i + 1),
+                       MemOperand(reg_ctx_, 16 * (i + 1)));
+            } else {
+                __ Stp(XRegister::GetXRegFromCode(i), XRegister::GetXRegFromCode(i + 1),
+                       MemOperand(reg_ctx_, 16 * i));
+            }
+        }
+        // lr
+        if (reg_ctx_.GetCode() != 30) {
+            __ Str(x30, MemOperand(reg_ctx_, protect_lr ? 8 * 30 : OFFSET_CTX_A64_TMP_LR));
+        }
+        // Sysregs
+        __ Mrs(tmp[0], NZCV);
+        __ Str(tmp[0].W(), MemOperand(reg_ctx_, OFFSET_CTX_A64_PSTATE));
+        __ Mrs(tmp[0], FPCR);
+        __ Str(tmp[0].W(), MemOperand(reg_ctx_, OFFSET_CTX_A64_FPCR));
+        __ Mrs(tmp[0], FPSR);
+        __ Str(tmp[0].W(), MemOperand(reg_ctx_, OFFSET_CTX_A64_FPSR));
+        // Sp
+        __ Str(sp, MemOperand(reg_ctx_, OFFSET_CTX_A64_SP));
+        // Pc
+        __ Mov(tmp[0], cur_pc_);
+        __ Str(tmp[0], MemOperand(reg_ctx_, OFFSET_CTX_A64_PC));
+        // VRegs
+        __ Add(tmp[0], reg_ctx_, OFFSET_CTX_A64_VEC_REG);
+        for (int i = 0; i < 32; i += 2) {
+            __ Stp(VRegister::GetVRegFromCode(i), VRegister::GetVRegFromCode(i + 1),
+                   MemOperand(tmp[0], 32 * i));
+        }
+    };
+    WrapContext<1>(wrap);
+}
+
+void Context::RestoreContextCallerSaved(bool protect_lr) {
+    auto wrap = [this, protect_lr](std::array<Register, 1> tmp) -> void {
+        // XRegs
+        for (int i = 0; i < 31; i += 2) {
+            if (i == reg_ctx_.GetCode()) {
+                __ Ldr(XRegister::GetXRegFromCode(i),
+                       MemOperand(reg_ctx_, 16 * i));
+            } else if (i + 1 == reg_ctx_.GetCode()) {
+                __ Ldr(XRegister::GetXRegFromCode(i + 1),
+                       MemOperand(reg_ctx_, 16 * (i + 1)));
+            } else {
+                __ Ldp(XRegister::GetXRegFromCode(i), XRegister::GetXRegFromCode(i + 1),
+                       MemOperand(reg_ctx_, 16 * i));
+            }
+        }
+        // lr
+        if (reg_ctx_.GetCode() != 30) {
+            __ Ldr(x30, MemOperand(reg_ctx_, protect_lr ? 8 * 30 : OFFSET_CTX_A64_TMP_LR));
+        }
+        // Sysregs
+        __ Ldr(tmp[0].W(), MemOperand(reg_ctx_, OFFSET_CTX_A64_PSTATE));
+        __ Msr(NZCV, tmp[0]);
+        __ Ldr(tmp[0].W(), MemOperand(reg_ctx_, OFFSET_CTX_A64_FPCR));
+        __ Msr(FPCR, tmp[0]);
+        __ Ldr(tmp[0].W(), MemOperand(reg_ctx_, OFFSET_CTX_A64_FPSR));
+        __ Msr(FPSR, tmp[0]);
+        // Sp
+        __ Ldr(sp, MemOperand(reg_ctx_, OFFSET_CTX_A64_SP));
+        // VRegs
+        __ Add(tmp[0], reg_ctx_, OFFSET_CTX_A64_VEC_REG);
+        for (int i = 0; i < 32; i += 2) {
+            __ Ldp(VRegister::GetVRegFromCode(i), VRegister::GetVRegFromCode(i + 1),
+                   MemOperand(tmp[0], 32 * i));
+        }
+    };
+    WrapContext<1>(wrap);
+}
+
+void Context::CallSvc(u32 svc_num) {
+    auto wrap = [this, svc_num](std::array<Register, 1> tmp) -> void {
+        __ Mov(tmp[0], svc_num);
+        __ Str(tmp[0], MemOperand(reg_ctx_, OFFSET_CTX_A64_SVC_NUM));
+        PopX<1>(tmp);
+        PushX(lr);
+        __ Bl(cursor_.label_holder_->GetCallSvcLabel());
+        PopX(lr);
+    };
+    WrapContext<1>(wrap);
+}
+
+void Context::DispatherStub(CodeBlockRef block) {
+    __ Reset();
+    SaveContextCallerSaved();
+    __ Mov(x0, reinterpret_cast<VAddr>(CodeCacheDispatcherTrampoline));
+    __ Blr(x0);
+    RestoreContextCallerSaved();
+    auto stub_size = __ GetBuffer()->GetSizeInBytes();
+    auto buffer = block->AllocCodeBuffer(0, static_cast<u32>(stub_size));
+    std::memcpy(reinterpret_cast<void *>(block->GetBufferStart(buffer)), __ GetBuffer()->GetStartAddress<void *>(), stub_size);
+    __ Reset();
+}
+
+void Context::PageLookupStub(CodeBlockRef block) {
+    __ Reset();
+    SaveContextCallerSaved();
+    __ Mov(x0, reinterpret_cast<VAddr>(PageLookupTrampoline));
+    __ Blr(x0);
+    RestoreContextCallerSaved();
+    auto stub_size = __ GetBuffer()->GetSizeInBytes();
+    auto buffer = block->AllocCodeBuffer(0, static_cast<u32>(stub_size));
+    std::memcpy(reinterpret_cast<void *>(block->GetBufferStart(buffer)), __ GetBuffer()->GetStartAddress<void *>(), stub_size);
+    __ Reset();
+}
+
+void Context::CallSvcStub(CodeBlockRef block) {
+    __ Reset();
+    SaveContextFull();
+    __ Mov(x0, reinterpret_cast<VAddr>(CallSvcTrampoline));
+    __ Blr(x0);
+    RestoreContextFull();
+    auto stub_size = __ GetBuffer()->GetSizeInBytes();
+    auto buffer = block->AllocCodeBuffer(0, static_cast<u32>(stub_size));
+    std::memcpy(reinterpret_cast<void *>(block->GetBufferStart(buffer)), __ GetBuffer()->GetStartAddress<void *>(), stub_size);
+    __ Reset();
+}
+
+void Context::SpecStub(CodeBlockRef block) {
+    __ Reset();
+    SaveContextCallerSaved();
+    __ Mov(x0, reinterpret_cast<VAddr>(SpecTrampoline));
+    __ Blr(x0);
+    RestoreContextCallerSaved();
+    auto stub_size = __ GetBuffer()->GetSizeInBytes();
+    auto buffer = block->AllocCodeBuffer(0, static_cast<u32>(stub_size));
+    std::memcpy(reinterpret_cast<void *>(block->GetBufferStart(buffer)), __ GetBuffer()->GetStartAddress<void *>(), stub_size);
+    __ Reset();
+}
+
+ContextNoMemTrace::ContextNoMemTrace() : Context(TMP1, TMP0) {
     HOST_TLS[CTX_TLS_SLOT] = &context_;
-    HOST_TLS[SUSP_TLS_SLOT] = suspend_addr_;
-}
-
-void ContextNoMemTrace::WrapContext(std::function<void()> wrap) {
-    __ Push(REG_CTX);
-    __ Mrs(REG_CTX, TPIDR_EL0);
-    __ Ldr(REG_CTX, MemOperand(REG_CTX, CTX_TLS_SLOT * 8));
-    // save tmp0, tmp1
-    __ Str(TMP0, MemOperand(REG_CTX, OFFSET_CTX_A64_CPU_REG + 17 * 8));
-    __ Pop(TMP0);
-    __ Str(TMP0, MemOperand(REG_CTX, OFFSET_CTX_A64_CPU_REG + 16 * 8));
-    wrap();
-    // restore tmp0, tmp1
-    __ Ldp(TMP1, TMP0, MemOperand(REG_CTX, OFFSET_CTX_A64_CPU_REG + 16 * 8));
 }
 
 void ContextNoMemTrace::GetSp(u8 target) {
     auto rt = XRegister::GetXRegFromCode(target);
-    __ Ldr(rt, MemOperand(REG_CTX, OFFSET_CTX_A64_SP));
+    __ Ldr(rt, MemOperand(reg_ctx_, OFFSET_CTX_A64_SP));
 }
 
 void ContextNoMemTrace::GetPc(u8 target) {
     auto rt = XRegister::GetXRegFromCode(target);
-    __ Ldr(rt, MemOperand(REG_CTX, OFFSET_CTX_A64_PC));
-}
-
-void ContextNoMemTrace::SavePc(VAddr pc) {
-    __ Mov(TMP0, pc);
-    __ Str(TMP0, MemOperand(REG_CTX, OFFSET_CTX_A64_PC));
-}
-
-void ContextNoMemTrace::CheckSuspend(bool in_context_wrap) {
-    if (in_context_wrap) {
-        __ Mrs(TMP0, TPIDR_EL0);
-        __ Ldr(TMP0, MemOperand(TMP0, SUSP_TLS_SLOT * 8));
-        // if suspend, trigger 11 signal
-        __ Ldr(TMP0, MemOperand(TMP0));
-    }
-}
-
-void ContextNoMemTrace::ReadTPIDR(u8 target) {
-    auto wrap = [this, target]() -> void {
-        if (TMP0.GetCode() == target || TMP1.GetCode() == target) {
-            __ Ldr(TMP0, MemOperand(REG_CTX, OFFSET_CTX_A64_TPIDR));
-            __ Str(TMP0, MemOperand(REG_CTX, OFFSET_CTX_A64_CPU_REG + target * 8));
-        } else {
-            __ Ldr(XRegister::GetXRegFromCode(target), MemOperand(REG_CTX, OFFSET_CTX_A64_TPIDR));
-        }
-    };
-    WrapContext(wrap);
-}
-
-void ContextNoMemTrace::ReadTPIDRRO(u8 target) {
-    auto wrap = [this, target]() -> void {
-        if (TMP0.GetCode() == target || TMP1.GetCode() == target) {
-            __ Ldr(TMP0, MemOperand(REG_CTX, OFFSET_CTX_A64_TPIDRRO));
-            __ Str(TMP0, MemOperand(REG_CTX, OFFSET_CTX_A64_CPU_REG + target * 8));
-        } else {
-            __ Ldr(XRegister::GetXRegFromCode(target), MemOperand(REG_CTX, OFFSET_CTX_A64_TPIDRRO));
-        }
-    };
-    WrapContext(wrap);
-}
-
-
-void ContextNoMemTrace::SaveContextFull() {
-    auto wrap = [this]() -> void {
-        // XRegs
-        for (int i = 0; i < 32; ++i) {
-            if (i == 16) {
-                continue;
-            }
-            __ Stp(XRegister::GetXRegFromCode(i), XRegister::GetXRegFromCode(i + 1), MemOperand(REG_CTX, 16 * i));
-        }
-        // Sysregs
-        __ Mrs(TMP0, NZCV);
-        __ Str(TMP0.W(), MemOperand(REG_CTX, OFFSET_CTX_A64_PSTATE));
-        __ Mrs(TMP0, FPCR);
-        __ Str(TMP0.W(), MemOperand(REG_CTX, OFFSET_CTX_A64_FPCR));
-        __ Mrs(TMP0, FPSR);
-        __ Str(TMP0.W(), MemOperand(REG_CTX, OFFSET_CTX_A64_FPSR));
-        // Sp
-        __ Str(sp, MemOperand(REG_CTX, OFFSET_CTX_A64_SP));
-        // Pc
-        __ Mov(TMP0, cur_pc_);
-        __ Str(TMP0, MemOperand(REG_CTX, OFFSET_CTX_A64_PC));
-        // VRegs
-        __ Add(TMP0, REG_CTX, OFFSET_CTX_A64_VEC_REG);
-        for (int i = 0; i < 33; ++i) {
-            __ Stp(VRegister::GetVRegFromCode(i), XRegister::GetXRegFromCode(i + 1), MemOperand(TMP0, 32 * i));
-        }
-    };
-    WrapContext(wrap);
-}
-
-void ContextNoMemTrace::RestoreContextFull() {
-    auto wrap = [this]() -> void {
-        // XRegs
-        for (int i = 0; i < 32; ++i) {
-            if (i == 16) {
-                continue;
-            }
-            __ Ldp(XRegister::GetXRegFromCode(i), XRegister::GetXRegFromCode(i + 1), MemOperand(REG_CTX, 16 * i));
-        }
-        // Sysregs
-        __ Ldr(TMP0.W(), MemOperand(REG_CTX, OFFSET_CTX_A64_PSTATE));
-        __ Msr(NZCV, TMP0);
-        __ Ldr(TMP0.W(), MemOperand(REG_CTX, OFFSET_CTX_A64_FPCR));
-        __ Msr(FPCR, TMP0);
-        __ Ldr(TMP0.W(), MemOperand(REG_CTX, OFFSET_CTX_A64_FPSR));
-        __ Msr(FPSR, TMP0);
-        // Sp
-        __ Ldr(sp, MemOperand(REG_CTX, OFFSET_CTX_A64_SP));
-        // VRegs
-        __ Add(TMP0, REG_CTX, OFFSET_CTX_A64_VEC_REG);
-        for (int i = 0; i < 33; ++i) {
-            __ Ldp(VRegister::GetVRegFromCode(i), XRegister::GetXRegFromCode(i + 1), MemOperand(TMP0, 32 * i));
-        }
-    };
-    WrapContext(wrap);
+    __ Ldr(rt, MemOperand(reg_ctx_, OFFSET_CTX_A64_PC));
 }
 
 void ContextNoMemTrace::PreDispatch() {
@@ -165,70 +482,117 @@ void ContextNoMemTrace::PostDispatch() {
     __ Pop(TMP0, TMP1);
 }
 
-ContextWithMemTrace::ContextWithMemTrace() : Context(TMP1) {
+void ContextNoMemTrace::LoadContext() {
+    __ Push(reg_ctx_);
+    __ Mrs(reg_ctx_, TPIDR_EL0);
+    __ Ldr(reg_ctx_, MemOperand(reg_ctx_, CTX_TLS_SLOT * 8));
+    // save tmp0, tmp1
+    __ Str(TMP0, MemOperand(reg_ctx_, OFFSET_CTX_A64_CPU_REG + TMP0.GetCode() * 8));
+    __ Pop(TMP0);
+    __ Str(TMP0, MemOperand(reg_ctx_, OFFSET_CTX_A64_CPU_REG + reg_ctx_.GetCode() * 8));
+    // restore tmp0
+    __ Ldr(TMP0, MemOperand(reg_ctx_, OFFSET_CTX_A64_CPU_REG + TMP0.GetCode() * 8));
+}
+
+void ContextNoMemTrace::ClearContext() {
+    __ Ldr(reg_ctx_, MemOperand(reg_ctx_, OFFSET_CTX_A64_CPU_REG + reg_ctx_.GetCode() * 8));
+}
+
+
+ContextWithMemTrace::ContextWithMemTrace(SharedPtr<PageTable> page_table) : Context(TMP1, TMP0),
+                                                                            page_table_(
+                                                                                    page_table) {
     // Need keep CTX_REG, so rewrite all instructions used CTX_REG
+    page_bits_ = page_table->GetPageBits();
+    address_bits_unused_ = page_table->GetUnusedBits();
+    tlb_bits_ = page_table->Tbl()->TLBBits();
 }
 
 void ContextWithMemTrace::LookupFlatPageTable(u8 reg_addr) {
-    constexpr static int PAGE_BITS = 12;
     auto rt = XRegister::GetXRegFromCode(reg_addr);
-    auto [tmp_reg1, tmp_reg2] = PeekTmpRegs(reg_addr);
-    auto tmp1 = XRegister::GetXRegFromCode(tmp_reg1);
-    auto tmp2 = XRegister::GetXRegFromCode(tmp_reg2);
-    PushX(tmp_reg1, tmp_reg2);
-    __ Mov(tmp1, Operand(XRegister::GetXRegFromCode(reg_addr), LSR, PAGE_BITS));
-    __ Bfc(tmp1, sizeof(VAddr) * 8 - address_bits_unused_ - PAGE_BITS, address_bits_unused_ + PAGE_BITS);
-    __ Mov(tmp2, page_tabel_addr_);
-    __ Add(tmp1, tmp2, Operand(tmp1, LSL, 3));
-    __ Ldr(rt, MemOperand(tmp1));
-    PopX(tmp_reg1, tmp_reg2);
+    auto wrap = [this, rt](std::array<Register, 2> tmp) -> void {
+        auto tmp1 = tmp[0];
+        auto tmp2 = tmp[1];
+        __ Mov(tmp1, Operand(rt, LSR, page_bits_));
+        __ Bfc(tmp1, sizeof(VAddr) * 8 - address_bits_unused_ - page_bits_,
+               address_bits_unused_ + page_bits_);
+        __ Ldr(tmp2, MemOperand(reg_ctx_, OFFSET_CTX_A64_PAGE_TABLE));
+        __ Add(tmp1, tmp2, Operand(tmp1, LSL, 3));
+        __ Ldr(rt, MemOperand(tmp1));
+    };
+    WrapContext<2>(wrap, {rt});
 }
 
 void ContextWithMemTrace::LookupFlatPageTable(VAddr const_addr, u8 reg) {
-    constexpr static int PAGE_BITS = 12;
     auto rt = XRegister::GetXRegFromCode(reg);
-    __ Mov(rt ,page_tabel_addr_ + BitRange<VAddr>(const_addr, PAGE_BITS, sizeof(VAddr) * 8 - address_bits_unused_ - 1) * 8);
-    __ Ldr(rt, MemOperand(rt));
+    auto wrap = [this, rt, const_addr](std::array<Register, 1> tmp) -> void {
+        auto tmp1 = tmp[0];
+        PushX(tmp1);
+        __ Ldr(rt, MemOperand(reg_ctx_, OFFSET_CTX_A64_PAGE_TABLE));
+        __ Mov(tmp1, BitRange<VAddr>(const_addr, page_bits_,
+                                     sizeof(VAddr) * 8 - address_bits_unused_ - 1) * 8);
+        __ Add(rt, rt, tmp1);
+        __ Ldr(rt, MemOperand(rt));
+    };
+    WrapContext<1>(wrap, {rt});
 }
 
-void ContextWithMemTrace::PushX(u8 reg1, u8 reg2) {
-    assert(reg1 != REG_CTX.GetCode() && reg2 != REG_CTX.GetCode());
-    if (reg2 == NO_REG) {
-        auto rt = XRegister::GetXRegFromCode(reg1);
-        __ Str(rt, MemOperand(REG_CTX, OFFSET_CTX_A64_CPU_REG + rt.GetCode() * 8));
-    } else {
-        auto rt1 = XRegister::GetXRegFromCode(reg1);
-        auto rt2 = XRegister::GetXRegFromCode(reg2);
-        if (reg2 - reg1 == 1) {
-            __ Stp(rt1, rt2, MemOperand(REG_CTX, OFFSET_CTX_A64_CPU_REG + rt1.GetCode() * 8));
-        } else {
-            __ Str(rt1, MemOperand(REG_CTX, OFFSET_CTX_A64_CPU_REG + rt1.GetCode() * 8));
-            __ Str(rt2, MemOperand(REG_CTX, OFFSET_CTX_A64_CPU_REG + rt2.GetCode() * 8));
-        }
-    }
+void ContextWithMemTrace::LookupTLB(u8 reg_addr) {
+    auto rt = XRegister::GetXRegFromCode(reg_addr);
+    auto wrap = [this, rt](std::array<Register, 3> tmp) -> void {
+        auto label_hit = Label();
+        auto label_end = Label();
+        auto label_lookup_page_table = cursor_.label_holder_->GetPageLookupLabel();
+        auto tmp1 = tmp[0];
+        auto tmp2 = tmp[1];
+        auto tmp3 = tmp[2];
+        __ Mov(tmp1, Operand(rt, LSR, page_bits_));
+        __ Bfc(tmp1, tlb_bits_, sizeof(VAddr) * 8 - tlb_bits_);
+        __ Ldr(tmp2, MemOperand(reg_ctx_, OFFSET_CTX_A64_TLB));
+        // PTE size of a64 = 8, key = 8,so size of tlb entry = 16
+        __ Add(tmp1, tmp2, Operand(tmp1, LSL, 4));
+        __ Ldr(tmp3, MemOperand(tmp1));
+        __ Mov(tmp2, Operand(rt, LSR, page_bits_));
+        __ Sub(tmp3, tmp3, tmp2);
+        __ Cbz(tmp3, label_hit);
+        // miss cache
+        __ Str(tmp2, MemOperand(reg_ctx_, OFFSET_CTX_A64_QUERY_PAGE));
+        PopX<3>(tmp);
+        PushX(lr);
+        __ Bl(label_lookup_page_table);
+        PopX(lr);
+        __ Ldr(rt, MemOperand(reg_ctx_, OFFSET_CTX_A64_QUERY_PAGE));
+        __ B(label_end);
+        // hit, load pte
+        __ Bind(label_hit);
+        __ Ldr(rt, MemOperand(tmp1, 8));
+        __ Bind(label_end);
+    };
+    WrapContext<3>(wrap, {rt});
 }
 
-void ContextWithMemTrace::PopX(u8 reg1, u8 reg2) {
-    assert(reg1 != REG_CTX.GetCode() && reg2 != REG_CTX.GetCode());
-    if (reg2 == NO_REG) {
-        auto rt = XRegister::GetXRegFromCode(reg1);
-        __ Ldr(rt, MemOperand(REG_CTX, OFFSET_CTX_A64_CPU_REG + rt.GetCode() * 8));
-    } else {
-        auto rt1 = XRegister::GetXRegFromCode(reg1);
-        auto rt2 = XRegister::GetXRegFromCode(reg2);
-        if (reg2 - reg1 == 1) {
-            __ Ldp(rt1, rt2, MemOperand(REG_CTX, OFFSET_CTX_A64_CPU_REG + rt1.GetCode() * 8));
-        } else {
-            __ Ldr(rt1, MemOperand(REG_CTX, OFFSET_CTX_A64_CPU_REG + rt1.GetCode() * 8));
-            __ Ldr(rt2, MemOperand(REG_CTX, OFFSET_CTX_A64_CPU_REG + rt2.GetCode() * 8));
-        }
-    }
+void ContextWithMemTrace::LookupMultiLevelPageTable(u8 addr_reg) {
+
 }
 
-std::pair<u8, u8> ContextWithMemTrace::PeekTmpRegs(u8 reg_target) {
-    u8 r1 = 0;
-    for (int i = 0; i < 30; ++i) {
+void ContextWithMemTrace::CheckReadSpec(Register pte_reg, Register offset_reg) {
+    auto label_skip = Label();
+    auto label_hook = cursor_.label_holder_->GetSpecLabel();
+    __ Tbz(pte_reg, READ_SPEC_BITS, label_skip);
+    // go hook
+    PushX(lr);
+    __ Bl(label_hook);
+    PopX(lr);
+    __ Bind(label_skip);
+}
 
-    }
-    return std::make_pair(0, 1);
+void ContextWithMemTrace::CheckWriteSpec(Register pte_reg, Register offset_reg) {
+    auto label_skip = Label();
+    auto label_hook = cursor_.label_holder_->GetSpecLabel();
+    __ Tbz(pte_reg, WRITE_SPEC_BITS, label_skip);
+    // go hook
+    PushX(lr);
+    __ Bl(label_hook);
+    PopX(lr);
+    __ Bind(label_skip);
 }

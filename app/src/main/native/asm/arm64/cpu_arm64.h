@@ -82,7 +82,7 @@ namespace CPU::A64 {
         u64 X;
         struct {
             u64 W : 32;
-            u64 R: 32;
+            u64 R : 32;
         };
     } Reg;
 
@@ -100,8 +100,15 @@ namespace CPU::A64 {
         int A, I, F;
     };
 
+    struct VirtualTLB {
+        VAddr vaddr;
+        VAddr target;
+    };
+
     struct CPUContext {
-        Reg cpu_registers[31];
+        Reg cpu_registers[29];
+        Reg fp; // x29
+        Reg lr; // x30
         u64 sp;
         u64 pc;
         PSTATE pstate;
@@ -110,7 +117,16 @@ namespace CPU::A64 {
         u32 fpsr;
         u64 tpidr;
         u64 tpidrro;
-        VAddr forward;
+        // memory
+        VAddr tlb;
+        VAddr page_table;
+        // dispatcher
+        VAddr dispatcher_table;
+        // flags
+        VAddr suspend_flag;
+        // help fields
+        u64 forward;
+        u64 tmp_lr;
     };
 }
 
@@ -124,4 +140,11 @@ extern "C" const VAddr OFFSET_CTX_A64_FPSR;
 extern "C" const VAddr OFFSET_CTX_A64_TPIDR;
 extern "C" const VAddr OFFSET_CTX_A64_TPIDRRO;
 extern "C" const VAddr OFFSET_CTX_A64_FORWARD;
+extern "C" const VAddr OFFSET_CTX_A64_QUERY_PAGE;
+extern "C" const VAddr OFFSET_CTX_A64_TLB;
+extern "C" const VAddr OFFSET_CTX_A64_PAGE_TABLE;
+extern "C" const VAddr OFFSET_CTX_A64_SUSPEND_ADDR;
+extern "C" const VAddr OFFSET_CTX_A64_DISPATCHER_TABLE;
+extern "C" const VAddr OFFSET_CTX_A64_TMP_LR;
+extern "C" const VAddr OFFSET_CTX_A64_SVC_NUM;
 

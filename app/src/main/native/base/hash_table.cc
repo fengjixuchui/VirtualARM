@@ -3,3 +3,5 @@
 //
 
 #include "hash_table.h"
+
+using namespace Utils;

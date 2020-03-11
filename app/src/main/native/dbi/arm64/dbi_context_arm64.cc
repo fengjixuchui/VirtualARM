@@ -74,13 +74,17 @@ Context::Context(const Register &reg_ctx, const Register &reg_forward)
                                                                   MAP_PRIVATE | MAP_ANONYMOUS |
                                                                   MAP_FIXED,
                                                                   -1, 0)));
-    context_.suspend_flag = suspend_addr_;
+    host_stack_ = reinterpret_cast<VAddr>(malloc(HOST_STACK_SIZE));
     code_find_table_ = SharedPtr<FindTable<VAddr>>(new FindTable<VAddr>(48, 2));
+    context_.suspend_flag = suspend_addr_;
+    context_.dispatcher_table = code_find_table_->TableEntryPtr();
+    context_.host_sp = host_stack_ + HOST_STACK_SIZE;
     current_ = this;
 }
 
 Context::~Context() {
     munmap(reinterpret_cast<void *>(suspend_addr_), PAGE_SIZE);
+    free(reinterpret_cast<void *>(host_stack_));
 }
 
 void Context::SetCodeCachePosition(VAddr addr) {
@@ -90,16 +94,16 @@ void Context::SetCodeCachePosition(VAddr addr) {
 
 void Context::FlushCodeCache(CodeBlockRef block, bool bind_stub) {
     assert(cursor_.origin_code_start_ > 0);
-    auto buffer = block->AllocCodeBuffer(cursor_.origin_code_start_,
-                                         static_cast<u32>(__ GetBuffer()->GetSizeInBytes()));
+    auto buffer = block->AllocCodeBuffer(cursor_.origin_code_start_);
+    block->FlushCodeBuffer(buffer, static_cast<u32>(__ GetBuffer()->GetSizeInBytes()));
     auto buffer_start = block->GetBufferStart(buffer);
     if (bind_stub) {
         cursor_.label_holder_->SetDestBuffer(buffer_start);
         // Fill Trampolines addr
         cursor_.label_holder_->BindDispatcherTrampoline(block->GetBufferStart(0));
-        cursor_.label_holder_->BindPageLookupTrampoline(block->GetBufferStart(1));
-        cursor_.label_holder_->BindCallSvcTrampoline(block->GetBufferStart(2));
-        cursor_.label_holder_->BindSpecTrampoline(block->GetBufferStart(3));
+        cursor_.label_holder_->BindCallSvcTrampoline(block->GetBufferStart(1));
+        cursor_.label_holder_->BindSpecTrampoline(block->GetBufferStart(2));
+        cursor_.label_holder_->BindPageLookupTrampoline(block->GetBufferStart(3));
     }
     __ FinalizeCode();
     std::memcpy(reinterpret_cast<void *>(buffer_start), __ GetBuffer()->GetStartAddress<void *>(),
@@ -112,6 +116,10 @@ void Context::FlushCodeCache(CodeBlockRef block, bool bind_stub) {
 
 SharedPtr<Context>& Context::Current() {
     return current_;
+}
+
+MacroAssembler &Context::Assembler() {
+    return masm_;
 }
 
 const CPU::A64::CPUContext &Context::GetCPUContext() const {
@@ -239,6 +247,14 @@ void Context::FindForwardTarget(u8 reg_target) {
 }
 
 void Context::FindForwardTarget(VAddr const_target) {
+
+}
+
+void Context::RestoreForwardRegister() {
+    auto wrap = [this](std::array<Register, 0> tmp) -> void {
+        PopX(reg_forward_);
+    };
+    WrapContext<0>(wrap);
 }
 
 void Context::SaveContextFull(bool protect_lr) {
@@ -407,6 +423,7 @@ void Context::CallSvc(u32 svc_num) {
         PopX<1>(tmp);
         PushX(lr);
         __ Bl(cursor_.label_holder_->GetCallSvcLabel());
+        LoadContext();
         PopX(lr);
     };
     WrapContext<1>(wrap);
@@ -415,49 +432,69 @@ void Context::CallSvc(u32 svc_num) {
 void Context::DispatherStub(CodeBlockRef block) {
     __ Reset();
     SaveContextCallerSaved();
+    PrepareHostStack();
+    LoadContext();
+    __ Push(reg_ctx_);
     __ Mov(x0, reinterpret_cast<VAddr>(CodeCacheDispatcherTrampoline));
     __ Blr(x0);
+    __ Pop(reg_ctx_);
+    PrepareGuestStack();
     RestoreContextCallerSaved();
+    __ Ret();
     auto stub_size = __ GetBuffer()->GetSizeInBytes();
-    auto buffer = block->AllocCodeBuffer(0, static_cast<u32>(stub_size));
+    auto buffer = block->AllocCodeBuffer(0);
+    block->FlushCodeBuffer(buffer, static_cast<u32>(stub_size));
     std::memcpy(reinterpret_cast<void *>(block->GetBufferStart(buffer)), __ GetBuffer()->GetStartAddress<void *>(), stub_size);
-    __ Reset();
-}
-
-void Context::PageLookupStub(CodeBlockRef block) {
-    __ Reset();
-    SaveContextCallerSaved();
-    __ Mov(x0, reinterpret_cast<VAddr>(PageLookupTrampoline));
-    __ Blr(x0);
-    RestoreContextCallerSaved();
-    auto stub_size = __ GetBuffer()->GetSizeInBytes();
-    auto buffer = block->AllocCodeBuffer(0, static_cast<u32>(stub_size));
-    std::memcpy(reinterpret_cast<void *>(block->GetBufferStart(buffer)), __ GetBuffer()->GetStartAddress<void *>(), stub_size);
+    ClearCachePlatform(block->GetBufferStart(buffer), stub_size);
     __ Reset();
 }
 
 void Context::CallSvcStub(CodeBlockRef block) {
     __ Reset();
     SaveContextFull();
+    PrepareHostStack();
+    LoadContext();
+    __ Push(reg_ctx_);
     __ Mov(x0, reinterpret_cast<VAddr>(CallSvcTrampoline));
     __ Blr(x0);
+    __ Pop(reg_ctx_);
+    PrepareGuestStack();
     RestoreContextFull();
+    __ Ret();
     auto stub_size = __ GetBuffer()->GetSizeInBytes();
-    auto buffer = block->AllocCodeBuffer(0, static_cast<u32>(stub_size));
+    auto buffer = block->AllocCodeBuffer(0);
+    block->FlushCodeBuffer(buffer, static_cast<u32>(stub_size));
     std::memcpy(reinterpret_cast<void *>(block->GetBufferStart(buffer)), __ GetBuffer()->GetStartAddress<void *>(), stub_size);
+    ClearCachePlatform(block->GetBufferStart(buffer), stub_size);
     __ Reset();
 }
 
 void Context::SpecStub(CodeBlockRef block) {
     __ Reset();
     SaveContextCallerSaved();
+    PrepareHostStack();
+    LoadContext();
+    __ Push(reg_ctx_);
     __ Mov(x0, reinterpret_cast<VAddr>(SpecTrampoline));
     __ Blr(x0);
+    __ Pop(reg_ctx_);
+    PrepareGuestStack();
     RestoreContextCallerSaved();
+    __ Ret();
     auto stub_size = __ GetBuffer()->GetSizeInBytes();
-    auto buffer = block->AllocCodeBuffer(0, static_cast<u32>(stub_size));
+    auto buffer = block->AllocCodeBuffer(0);
+    block->FlushCodeBuffer(buffer, static_cast<u32>(stub_size));
     std::memcpy(reinterpret_cast<void *>(block->GetBufferStart(buffer)), __ GetBuffer()->GetStartAddress<void *>(), stub_size);
+    ClearCachePlatform(block->GetBufferStart(buffer), stub_size);
     __ Reset();
+}
+
+void Context::PrepareHostStack() {
+    __ Ldr(sp, MemOperand(reg_ctx_, OFFSET_CTX_A64_HOST_SP));
+}
+
+void Context::PrepareGuestStack() {
+    __ Str(sp, MemOperand(reg_ctx_, OFFSET_CTX_A64_HOST_SP));
 }
 
 ContextNoMemTrace::ContextNoMemTrace() : Context(TMP1, TMP0) {
@@ -498,6 +535,10 @@ void ContextNoMemTrace::ClearContext() {
     __ Ldr(reg_ctx_, MemOperand(reg_ctx_, OFFSET_CTX_A64_CPU_REG + reg_ctx_.GetCode() * 8));
 }
 
+u32 ContextNoMemTrace::CodeSizeOfForwardRestore() {
+    return 8 * 8;
+}
+
 
 ContextWithMemTrace::ContextWithMemTrace(SharedPtr<PageTable> page_table) : Context(TMP1, TMP0),
                                                                             page_table_(
@@ -506,6 +547,8 @@ ContextWithMemTrace::ContextWithMemTrace(SharedPtr<PageTable> page_table) : Cont
     page_bits_ = page_table->GetPageBits();
     address_bits_unused_ = page_table->GetUnusedBits();
     tlb_bits_ = page_table->Tbl()->TLBBits();
+    context_.tlb = page_table->Tbl()->TLBTablePtr();
+    context_.page_table = page_table->TopPageTable();
 }
 
 void ContextWithMemTrace::LookupFlatPageTable(u8 reg_addr) {
@@ -560,6 +603,7 @@ void ContextWithMemTrace::LookupTLB(u8 reg_addr) {
         PopX<3>(tmp);
         PushX(lr);
         __ Bl(label_lookup_page_table);
+        LoadContext();
         PopX(lr);
         __ Ldr(rt, MemOperand(reg_ctx_, OFFSET_CTX_A64_QUERY_PAGE));
         __ B(label_end);
@@ -571,8 +615,47 @@ void ContextWithMemTrace::LookupTLB(u8 reg_addr) {
     WrapContext<3>(wrap, {rt});
 }
 
-void ContextWithMemTrace::LookupMultiLevelPageTable(u8 addr_reg) {
-
+void ContextWithMemTrace::PageLookupStub(CodeBlockRef block) {
+    __ Reset();
+    class Label page_not_found;
+    // lookup page table
+    auto wrap = [this, &page_not_found](std::array<Register, 4> tmp) -> void {
+        auto level = page_table_->GetLevel();
+        // load page index
+        __ Ldr(tmp[0], MemOperand(reg_ctx_, OFFSET_CTX_A64_QUERY_PAGE));
+        // clear unused addr bits
+        __ Bfc(tmp[0], page_table_->GetPageBits() * level, address_bits_unused_);
+        // top page table
+        __ Ldr(tmp[1], MemOperand(reg_ctx_, OFFSET_CTX_A64_PAGE_TABLE));
+        while (level > 1) {
+            __ Mov(tmp[2], Operand(tmp[0], LSR,
+                                   static_cast<unsigned int>(page_table_->GetPageBits() *
+                                                             (level - 1))));
+            if (level != page_table_->GetLevel()) {
+                // clear upper level bits
+                __ Bfc(tmp[2], page_table_->GetPteBits() * (level - 1), page_table_->GetPteBits() * (level - 1));
+            }
+            __ Ldr(tmp[1], MemOperand(tmp[1], tmp[2], LSL, 3));
+            __ Cbz(tmp[1], &page_not_found);
+            level--;
+        }
+        __ Bfc(tmp[0], page_table_->GetPteBits(), page_table_->GetPteBits() * (level - 1));
+        // Load PTE, arm64 pte size = 8
+        __ Ldr(tmp[1], MemOperand(tmp[1], tmp[0], LSL, 3));
+        __ Cbz(tmp[1], &page_not_found);
+        __ Str(tmp[1], MemOperand(reg_ctx_, OFFSET_CTX_A64_QUERY_PAGE));
+        PopX<4>(tmp);
+        __ Ret();
+        __ Bind(&page_not_found);
+        // TODO
+    };
+    WrapContext<4>(wrap);
+    auto stub_size = __ GetBuffer()->GetSizeInBytes();
+    auto buffer = block->AllocCodeBuffer(0);
+    block->FlushCodeBuffer(buffer, static_cast<u32>(stub_size));
+    std::memcpy(reinterpret_cast<void *>(block->GetBufferStart(buffer)), __ GetBuffer()->GetStartAddress<void *>(), stub_size);
+    ClearCachePlatform(block->GetBufferStart(buffer), stub_size);
+    __ Reset();
 }
 
 void ContextWithMemTrace::CheckReadSpec(Register pte_reg, Register offset_reg) {
@@ -595,4 +678,8 @@ void ContextWithMemTrace::CheckWriteSpec(Register pte_reg, Register offset_reg) 
     __ Bl(label_hook);
     PopX(lr);
     __ Bind(label_skip);
+}
+
+u32 ContextWithMemTrace::CodeSizeOfForwardRestore() {
+    return 8;
 }

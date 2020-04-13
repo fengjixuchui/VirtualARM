@@ -12,8 +12,8 @@
 #include "block/host_code_block.h"
 
 using namespace vixl::aarch64;
-using namespace Code;
-using namespace Code::A64;
+using namespace CodeCache;
+using namespace CodeCache::A64;
 
 
 // TODO Code Invalid 粒度在于一个个 Block，那当某些线程仍跑在旧 Block 中时，新 Block 的改动被提交了，那么该线程仍会跑一段旧代码，syscall 后的代码较易复现
@@ -28,7 +28,7 @@ namespace DBI::A64 {
 #define TMP0 x17
 #define TMP1 x16
 #define HOST_TLS ({ void** __val; __asm__("mrs %0, tpidr_el0" : "=r"(__val)); __val; })
-#define HOST_STACK_SIZE 1U << 20
+#define HOST_STACK_SIZE (1U << 20)
 
     class LabelHolder : public BaseObject {
     public:
@@ -41,24 +41,35 @@ namespace DBI::A64 {
         Label *AllocLabel();
         Label *GetDispatcherLabel();
         Label *GetPageLookupLabel();
-        Label *GetCallSvcLabel();
+        Label *GetContextSwitchLabel();
         Label *GetSpecLabel();
+        Label *GetMapAddressLabel();
         void BindDispatcherTrampoline(VAddr addr);
         void BindPageLookupTrampoline(VAddr addr);
-        void BindCallSvcTrampoline(VAddr addr);
+        void BindContextSwitchTrampoline(VAddr addr);
         void BindSpecTrampoline(VAddr addr);
+        void BindMapAddress(VAddr addr);
     private:
         VAddr dest_buffer_start_;
         MacroAssembler &masm_;
         std::list<Label*> labels_;
         Label dispatcher_label_;
         Label page_lookup_label_;
-        Label call_svc_label_;
+        Label context_switch_label_;
         Label spec_label_;
+        Label map_address_label_;
     };
 
     class Context : public BaseObject {
     public:
+
+        enum ModifyCodeType {
+            LoadMemory,
+            StoreMemory,
+            ExceptionGen,
+            Brunch,
+            ReadWriteSysRegs
+        };
 
         Context(const Register &reg_ctx, const Register &reg_forward);
         virtual ~Context();
@@ -160,6 +171,10 @@ namespace DBI::A64 {
 
         void SavePc(VAddr pc, Register tmp);
 
+        void SavePcByModuleOffset(s64 offset, Register tmp1, Register tmp2);
+
+        void LoadPcByModuleOffset(s64 offset, Register target, Register tmp2);
+
         const CPU::A64::CPUContext &GetCPUContext() const;
 
         void LoadFromContext(Register target, VAddr offset);
@@ -171,8 +186,16 @@ namespace DBI::A64 {
         void SetSuspendFlag(bool suspend);
 
         virtual void GetSp(u8 target) {};
-
         virtual void GetPc(u8 target) {};
+
+
+        // mark translated codes
+        void ModifyCodeStart(ModifyCodeType type);
+        void ModifyCodeEnd();
+
+        // Set Register
+        void SetRegisterX(u8 reg_x, u64 value);
+        void SetRegisterW(u8 reg_w, u32 value);
 
         // sysreg
         void ReadTPIDR(u8 target);
@@ -185,19 +208,32 @@ namespace DBI::A64 {
         virtual void RestoreContextCallerSaved(bool protect_lr = false);
         virtual void PrepareHostStack();
         virtual void PrepareGuestStack();
+        virtual void CheckPCAndDispatch();
 
         // brunch
         void FindForwardTarget(u8 reg_target);
         void FindForwardTarget(VAddr const_target);
-        void RestoreForwardRegister();
         virtual u32 CodeSizeOfForwardRestore() = 0;
+        void BeforeDispatch();
+        void AfterDispatch(VAddr pc, bool is_offset = false);
 
         // system
         void CallSvc(u32 svc_num);
 
+        // read write
+        template <typename T, bool is_float = false>
+        void ReadMemory(const VAddr vaddr, u8 target_reg) {
+
+        }
+
+        template <typename T, bool is_float = false>
+        void ReadMemory(u8 vaddr_reg, u8 target_reg) {
+
+        }
+
         // trampolines
         void DispatherStub(CodeBlockRef block);
-        void CallSvcStub(CodeBlockRef block);
+        void ContextSwitchStub(CodeBlockRef block);
         void SpecStub(CodeBlockRef block);
 
     protected:
@@ -212,7 +248,6 @@ namespace DBI::A64 {
         } cursor_;
         // must pic code
         MacroAssembler masm_{PositionIndependentCode};
-        u64 suspend_addr_;
         SharedPtr<FindTable<VAddr>> code_find_table_;
     };
 
@@ -240,7 +275,7 @@ namespace DBI::A64 {
 
     class ContextWithMemTrace : public Context {
     public:
-        ContextWithMemTrace(SharedPtr<PageTable> page_table);
+        ContextWithMemTrace(SharedPtr<A64MMU> mmu);
 
         void LookupTLB(u8 reg_addr);
 
@@ -262,7 +297,7 @@ namespace DBI::A64 {
         u8 tlb_bits_;
         bool hook_read_spec_;
         bool hook_write_spec_;
-        SharedPtr<PageTable> page_table_;
+        SharedPtr<A64MMU> mmu_;
     };
 
 }

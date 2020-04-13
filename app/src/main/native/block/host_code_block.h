@@ -7,7 +7,7 @@
 #include <base/marcos.h>
 #include <map>
 
-namespace Code {
+namespace CodeCache {
 
 #define MAX_BUFFER UINT16_MAX
 #define MAX_BLOCK_BIT 26
@@ -51,6 +51,8 @@ namespace Code {
         u16 GetCurrentId() const;
         std::mutex &Lock();
 
+        VAddr Base();
+
     protected:
         VAddr start_;
         VAddr size_;
@@ -93,9 +95,13 @@ namespace Code {
             VAddr GetDispatcherAddr(Buffer &buffer, bool with_pop_forward = true);
             VAddr GetDispatcherOffset(Buffer &buffer, bool with_pop_forward = true);
 
+            void SetModuleMapAddress(VAddr addr);
+            VAddr ModuleMapAddressAddress();
+
         protected:
             u32 dispatcher_count_;
             u32 forward_reg_rec_size_;
+            VAddr *module_base_;
             DispatcherTable *dispatcher_table_;
         };
 

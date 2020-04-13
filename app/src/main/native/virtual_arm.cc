@@ -7,12 +7,12 @@
 #include "asm/arm64/instruction_decode.h"
 #include "asm/arm64/cpu_arm64.h"
 #include "frontend/ir/instruction_ir.h"
-#include "dbi/arm64/dbi_visitor_arm64.h"
+#include "dbi/arm64/dbi_jit_arm64.h"
 
 
-using namespace Instruction::A64;
+using namespace Instructions::A64;
 using namespace CPU::A64;
-using namespace Instruction::IR;
+using namespace Instructions::IR;
 
 
 extern "C"

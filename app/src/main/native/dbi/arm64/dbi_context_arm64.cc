@@ -36,12 +36,16 @@ Label *LabelHolder::GetPageLookupLabel() {
     return &page_lookup_label_;
 }
 
-Label *LabelHolder::GetCallSvcLabel() {
-    return &call_svc_label_;
+Label *LabelHolder::GetContextSwitchLabel() {
+    return &context_switch_label_;
 }
 
 Label *LabelHolder::GetSpecLabel() {
     return &spec_label_;
+}
+
+Label *LabelHolder::GetMapAddressLabel() {
+    return &map_address_label_;
 }
 
 void LabelHolder::BindDispatcherTrampoline(VAddr addr) {
@@ -56,10 +60,10 @@ void LabelHolder::BindPageLookupTrampoline(VAddr addr) {
     __ BindToOffset(&page_lookup_label_, offset);
 }
 
-void LabelHolder::BindCallSvcTrampoline(VAddr addr) {
+void LabelHolder::BindContextSwitchTrampoline(VAddr addr) {
     assert(dest_buffer_start_);
     ptrdiff_t offset = dest_buffer_start_ - addr ;
-    __ BindToOffset(&call_svc_label_, offset);
+    __ BindToOffset(&context_switch_label_, offset);
 }
 
 void LabelHolder::BindSpecTrampoline(VAddr addr) {
@@ -68,22 +72,24 @@ void LabelHolder::BindSpecTrampoline(VAddr addr) {
     __ BindToOffset(&spec_label_, offset);
 }
 
+void LabelHolder::BindMapAddress(VAddr addr) {
+    assert(dest_buffer_start_);
+    ptrdiff_t offset = dest_buffer_start_ - addr;
+    __ BindToOffset(&map_address_label_, offset);
+}
+
+
 Context::Context(const Register &reg_ctx, const Register &reg_forward)
         : masm_{}, reg_ctx_{reg_ctx}, reg_forward_(reg_forward) {
-    suspend_addr_ = reinterpret_cast<u64>(static_cast<u64 *>(mmap(0, PAGE_SIZE, PROT_READ,
-                                                                  MAP_PRIVATE | MAP_ANONYMOUS |
-                                                                  MAP_FIXED,
-                                                                  -1, 0)));
     host_stack_ = reinterpret_cast<VAddr>(malloc(HOST_STACK_SIZE));
     code_find_table_ = SharedPtr<FindTable<VAddr>>(new FindTable<VAddr>(48, 2));
-    context_.suspend_flag = suspend_addr_;
+    context_.suspend_flag = 0;
     context_.dispatcher_table = code_find_table_->TableEntryPtr();
     context_.host_sp = host_stack_ + HOST_STACK_SIZE;
     current_ = this;
 }
 
 Context::~Context() {
-    munmap(reinterpret_cast<void *>(suspend_addr_), PAGE_SIZE);
     free(reinterpret_cast<void *>(host_stack_));
 }
 
@@ -101,9 +107,10 @@ void Context::FlushCodeCache(CodeBlockRef block, bool bind_stub) {
         cursor_.label_holder_->SetDestBuffer(buffer_start);
         // Fill Trampolines addr
         cursor_.label_holder_->BindDispatcherTrampoline(block->GetBufferStart(0));
-        cursor_.label_holder_->BindCallSvcTrampoline(block->GetBufferStart(1));
+        cursor_.label_holder_->BindContextSwitchTrampoline(block->GetBufferStart(1));
         cursor_.label_holder_->BindSpecTrampoline(block->GetBufferStart(2));
         cursor_.label_holder_->BindPageLookupTrampoline(block->GetBufferStart(3));
+        cursor_.label_holder_->BindMapAddress(block->ModuleMapAddressAddress());
     }
     __ FinalizeCode();
     std::memcpy(reinterpret_cast<void *>(buffer_start), __ GetBuffer()->GetStartAddress<void *>(),
@@ -135,7 +142,7 @@ void Context::SetCurPc(VAddr cur_pc) {
 }
 
 void Context::SetSuspendFlag(bool suspend) {
-    mprotect(reinterpret_cast<void *>(suspend_addr_), PAGE_SIZE, suspend ? PROT_NONE : PROT_READ);
+    context_.suspend_flag = suspend ? 1 : 0;
 }
 
 void Context::Emit(u32 instr) {
@@ -175,14 +182,34 @@ void Context::PopX(Register reg1, Register reg2) {
 }
 
 void Context::CheckSuspend(Register tmp) {
+    auto *label_skip = Label();
     __ Ldr(tmp, MemOperand(reg_ctx_, OFFSET_CTX_A64_SUSPEND_ADDR));
-    // if suspend, trigger 11 signal
-    __ Ldr(tmp, MemOperand(TMP0));
+    __ Cbz(tmp, label_skip);
+    PushX(lr);
+    __ Bl(cursor_.label_holder_->GetContextSwitchLabel());
+    PopX(lr);
+    __ Bind(label_skip);
 }
 
 void Context::SavePc(VAddr pc, Register tmp) {
     __ Mov(tmp, pc);
     __ Str(tmp, MemOperand(reg_ctx_, OFFSET_CTX_A64_PC));
+}
+
+void Context::SavePcByModuleOffset(s64 offset, Register tmp1, Register tmp2) {
+    LoadPcByModuleOffset(offset, tmp1, tmp2);
+    __ Str(tmp1, MemOperand(reg_ctx_, OFFSET_CTX_A64_PC));
+}
+
+void Context::LoadPcByModuleOffset(s64 offset, Register target, Register tmp2) {
+    __ Adrp(target, cursor_.label_holder_->GetMapAddressLabel());
+    __ Ldr(target, MemOperand(target));
+    __ Mov(tmp2, static_cast<u64>(std::abs(offset)));
+    if (offset >= 0) {
+        __ Add(target, target, tmp2);
+    } else {
+        __ Sub(target, target, tmp2);
+    }
 }
 
 void Context::LoadFromContext(Register rt, VAddr offset) {
@@ -198,6 +225,14 @@ void Context::LoadFromContext(Register rt, VAddr offset) {
         };
         WrapContext<0>(wrap, {rt});
     }
+}
+
+void Context::SetRegisterX(u8 reg_x, u64 value) {
+    __ Mov(XRegister::GetXRegFromCode(reg_x), value);
+}
+
+void Context::SetRegisterW(u8 reg_w, u32 value) {
+    __ Mov(WRegister::GetWRegFromCode(reg_w), value);
 }
 
 void Context::ReadTPIDR(u8 target) {
@@ -217,7 +252,7 @@ void Context::FindForwardTarget(u8 reg_target) {
         auto *gen_code = cursor_.label_holder_->GetDispatcherLabel();
         // Find hash table
         __ Ldr(tmp[0], MemOperand(reg_ctx_, OFFSET_CTX_A64_DISPATCHER_TABLE));
-        __ Mov(tmp[1], Operand(rt, LSR, CODE_CACHE_HASH_BITS));
+        __ Lsr(tmp[1], rt, CODE_CACHE_HASH_BITS);
         __ Bfc(tmp[1], code_find_table_->TableBits(),
                sizeof(VAddr) * 8 - code_find_table_->TableBits());
         __ Ldr(tmp[0], MemOperand(tmp[0], tmp[1], LSL, 3));
@@ -250,11 +285,24 @@ void Context::FindForwardTarget(VAddr const_target) {
 
 }
 
-void Context::RestoreForwardRegister() {
-    auto wrap = [this](std::array<Register, 0> tmp) -> void {
-        PopX(reg_forward_);
-    };
-    WrapContext<0>(wrap);
+void Context::BeforeDispatch() {
+    PushX(reg_forward_);
+}
+
+void Context::AfterDispatch(VAddr pc, bool is_offset) {
+    if (is_offset) {
+        auto wrap = [this, pc](std::array<Register, 1> tmp) -> void {
+            SavePcByModuleOffset(pc, reg_forward_, tmp[0]);
+            PopX(reg_forward_);
+        };
+        WrapContext<1>(wrap, {reg_forward_});
+    } else {
+        auto wrap = [this, pc](std::array<Register, 0> tmp) -> void {
+            SavePc(pc, reg_forward_);
+            PopX(reg_forward_);
+        };
+        WrapContext<0>(wrap);
+    }
 }
 
 void Context::SaveContextFull(bool protect_lr) {
@@ -285,9 +333,11 @@ void Context::SaveContextFull(bool protect_lr) {
         __ Str(tmp[0].W(), MemOperand(reg_ctx_, OFFSET_CTX_A64_FPSR));
         // Sp
         __ Str(sp, MemOperand(reg_ctx_, OFFSET_CTX_A64_SP));
-        // Pc
-        __ Mov(tmp[0], cur_pc_);
-        __ Str(tmp[0], MemOperand(reg_ctx_, OFFSET_CTX_A64_PC));
+        // Protect Pc
+        // Pc could be changed by host
+        // dispatch if changed
+        __ Ldr(tmp[0], MemOperand(reg_ctx_, OFFSET_CTX_A64_PC));
+        __ Str(tmp[0], MemOperand(reg_ctx_, OFFSET_CTX_A64_TMP_PC));
         // VRegs
         __ Add(tmp[0], reg_ctx_, OFFSET_CTX_A64_VEC_REG);
         for (int i = 0; i < 32; i += 2) {
@@ -422,7 +472,7 @@ void Context::CallSvc(u32 svc_num) {
         __ Str(tmp[0], MemOperand(reg_ctx_, OFFSET_CTX_A64_SVC_NUM));
         PopX<1>(tmp);
         PushX(lr);
-        __ Bl(cursor_.label_holder_->GetCallSvcLabel());
+        __ Bl(cursor_.label_holder_->GetContextSwitchLabel());
         LoadContext();
         PopX(lr);
     };
@@ -441,6 +491,7 @@ void Context::DispatherStub(CodeBlockRef block) {
     PrepareGuestStack();
     RestoreContextCallerSaved();
     __ Ret();
+    __ FinalizeCode();
     auto stub_size = __ GetBuffer()->GetSizeInBytes();
     auto buffer = block->AllocCodeBuffer(0);
     block->FlushCodeBuffer(buffer, static_cast<u32>(stub_size));
@@ -449,21 +500,26 @@ void Context::DispatherStub(CodeBlockRef block) {
     __ Reset();
 }
 
-void Context::CallSvcStub(CodeBlockRef block) {
+void Context::ContextSwitchStub(CodeBlockRef block) {
+    SetCodeCachePosition(0);
     __ Reset();
     SaveContextFull();
     PrepareHostStack();
     LoadContext();
     __ Push(reg_ctx_);
-    __ Mov(x0, reinterpret_cast<VAddr>(CallSvcTrampoline));
+    __ Mov(x0, reinterpret_cast<VAddr>(ContextSwitchTrampoline));
     __ Blr(x0);
     __ Pop(reg_ctx_);
     PrepareGuestStack();
     RestoreContextFull();
+    CheckPCAndDispatch();
     __ Ret();
     auto stub_size = __ GetBuffer()->GetSizeInBytes();
     auto buffer = block->AllocCodeBuffer(0);
     block->FlushCodeBuffer(buffer, static_cast<u32>(stub_size));
+    cursor_.label_holder_->SetDestBuffer(block->GetBufferStart(buffer));
+    cursor_.label_holder_->BindContextSwitchTrampoline(block->GetBufferStart(1));
+    __ FinalizeCode();
     std::memcpy(reinterpret_cast<void *>(block->GetBufferStart(buffer)), __ GetBuffer()->GetStartAddress<void *>(), stub_size);
     ClearCachePlatform(block->GetBufferStart(buffer), stub_size);
     __ Reset();
@@ -481,6 +537,7 @@ void Context::SpecStub(CodeBlockRef block) {
     PrepareGuestStack();
     RestoreContextCallerSaved();
     __ Ret();
+    __ FinalizeCode();
     auto stub_size = __ GetBuffer()->GetSizeInBytes();
     auto buffer = block->AllocCodeBuffer(0);
     block->FlushCodeBuffer(buffer, static_cast<u32>(stub_size));
@@ -495,6 +552,35 @@ void Context::PrepareHostStack() {
 
 void Context::PrepareGuestStack() {
     __ Str(sp, MemOperand(reg_ctx_, OFFSET_CTX_A64_HOST_SP));
+}
+
+void Context::CheckPCAndDispatch() {
+    auto wrap = [this](std::array<Register, 2> tmp) -> void {
+        auto *not_changed = Label();
+        __ Ldr(tmp[0], MemOperand(reg_ctx_, OFFSET_CTX_A64_PC));
+        __ Ldr(tmp[1], MemOperand(reg_ctx_, OFFSET_CTX_A64_TMP_PC));
+        __ Sub(tmp[1], tmp[1], tmp[0]);
+        __ Cbz(tmp[1], not_changed);
+        PopX(tmp[1]);
+        FindForwardTarget(static_cast<u8>(tmp[0].GetCode()));
+        __ Mov(reg_forward_, tmp[0]);
+        if (tmp[0].GetCode() != reg_forward_.GetCode()) {
+            PopX(tmp[0]);
+        }
+        // restore real lr, because will never come back
+        PopX(lr);
+        __ Br(reg_forward_);
+        __ Bind(not_changed);
+    };
+    WrapContext<2>(wrap);
+}
+
+void Context::ModifyCodeStart(Context::ModifyCodeType type) {
+
+}
+
+void Context::ModifyCodeEnd() {
+
 }
 
 ContextNoMemTrace::ContextNoMemTrace() : Context(TMP1, TMP0) {
@@ -540,15 +626,14 @@ u32 ContextNoMemTrace::CodeSizeOfForwardRestore() {
 }
 
 
-ContextWithMemTrace::ContextWithMemTrace(SharedPtr<PageTable> page_table) : Context(TMP1, TMP0),
-                                                                            page_table_(
-                                                                                    page_table) {
+ContextWithMemTrace::ContextWithMemTrace(SharedPtr<A64MMU> mmu) : Context(TMP1, TMP0),
+                                                                  mmu_(mmu) {
     // Need keep CTX_REG, so rewrite all instructions used CTX_REG
-    page_bits_ = page_table->GetPageBits();
-    address_bits_unused_ = page_table->GetUnusedBits();
-    tlb_bits_ = page_table->Tbl()->TLBBits();
-    context_.tlb = page_table->Tbl()->TLBTablePtr();
-    context_.page_table = page_table->TopPageTable();
+    page_bits_ = mmu->GetPageBits();
+    address_bits_unused_ = mmu->GetUnusedBits();
+    tlb_bits_ = mmu->Tbl()->TLBBits();
+    context_.tlb = mmu->Tbl()->TLBTablePtr();
+    context_.page_table = mmu->TopPageTable();
 }
 
 void ContextWithMemTrace::LookupFlatPageTable(u8 reg_addr) {
@@ -556,7 +641,7 @@ void ContextWithMemTrace::LookupFlatPageTable(u8 reg_addr) {
     auto wrap = [this, rt](std::array<Register, 2> tmp) -> void {
         auto tmp1 = tmp[0];
         auto tmp2 = tmp[1];
-        __ Mov(tmp1, Operand(rt, LSR, page_bits_));
+        __ Lsr(tmp1, rt, page_bits_);
         __ Bfc(tmp1, sizeof(VAddr) * 8 - address_bits_unused_ - page_bits_,
                address_bits_unused_ + page_bits_);
         __ Ldr(tmp2, MemOperand(reg_ctx_, OFFSET_CTX_A64_PAGE_TABLE));
@@ -583,19 +668,21 @@ void ContextWithMemTrace::LookupFlatPageTable(VAddr const_addr, u8 reg) {
 void ContextWithMemTrace::LookupTLB(u8 reg_addr) {
     auto rt = XRegister::GetXRegFromCode(reg_addr);
     auto wrap = [this, rt](std::array<Register, 3> tmp) -> void {
-        auto label_hit = Label();
-        auto label_end = Label();
-        auto label_lookup_page_table = cursor_.label_holder_->GetPageLookupLabel();
+        auto *label_hit = Label();
+        auto *label_end = Label();
+        auto *label_lookup_page_table = cursor_.label_holder_->GetPageLookupLabel();
         auto tmp1 = tmp[0];
         auto tmp2 = tmp[1];
         auto tmp3 = tmp[2];
-        __ Mov(tmp1, Operand(rt, LSR, page_bits_));
+        __ Mov(tmp1, Operand(rt));
+        __ Lsr(tmp1, tmp1, page_bits_);
         __ Bfc(tmp1, tlb_bits_, sizeof(VAddr) * 8 - tlb_bits_);
         __ Ldr(tmp2, MemOperand(reg_ctx_, OFFSET_CTX_A64_TLB));
         // PTE size of a64 = 8, key = 8,so size of tlb entry = 16
-        __ Add(tmp1, tmp2, Operand(tmp1, LSL, 4));
+        __ Lsl(tmp1, tmp1, 4);
+        __ Add(tmp1, tmp2, tmp1);
         __ Ldr(tmp3, MemOperand(tmp1));
-        __ Mov(tmp2, Operand(rt, LSR, page_bits_));
+        __ Lsr(tmp2, rt, page_bits_);
         __ Sub(tmp3, tmp3, tmp2);
         __ Cbz(tmp3, label_hit);
         // miss cache
@@ -620,26 +707,25 @@ void ContextWithMemTrace::PageLookupStub(CodeBlockRef block) {
     class Label page_not_found;
     // lookup page table
     auto wrap = [this, &page_not_found](std::array<Register, 4> tmp) -> void {
-        auto level = page_table_->GetLevel();
+        auto level = mmu_->GetLevel();
         // load page index
         __ Ldr(tmp[0], MemOperand(reg_ctx_, OFFSET_CTX_A64_QUERY_PAGE));
         // clear unused addr bits
-        __ Bfc(tmp[0], page_table_->GetPageBits() * level, address_bits_unused_);
+        __ Bfc(tmp[0], mmu_->GetPageBits() * level, address_bits_unused_);
         // top page table
         __ Ldr(tmp[1], MemOperand(reg_ctx_, OFFSET_CTX_A64_PAGE_TABLE));
         while (level > 1) {
-            __ Mov(tmp[2], Operand(tmp[0], LSR,
-                                   static_cast<unsigned int>(page_table_->GetPageBits() *
-                                                             (level - 1))));
-            if (level != page_table_->GetLevel()) {
+            __ Lsr(tmp[2], tmp[0], static_cast<unsigned int>(mmu_->GetPageBits() *
+                                                             (level - 1)));
+            if (level != mmu_->GetLevel()) {
                 // clear upper level bits
-                __ Bfc(tmp[2], page_table_->GetPteBits() * (level - 1), page_table_->GetPteBits() * (level - 1));
+                __ Bfc(tmp[2], mmu_->GetPteBits() * (level - 1), mmu_->GetPteBits() * (level - 1));
             }
             __ Ldr(tmp[1], MemOperand(tmp[1], tmp[2], LSL, 3));
             __ Cbz(tmp[1], &page_not_found);
             level--;
         }
-        __ Bfc(tmp[0], page_table_->GetPteBits(), page_table_->GetPteBits() * (level - 1));
+        __ Bfc(tmp[0], mmu_->GetPteBits(), mmu_->GetPteBits() * (level - 1));
         // Load PTE, arm64 pte size = 8
         __ Ldr(tmp[1], MemOperand(tmp[1], tmp[0], LSL, 3));
         __ Cbz(tmp[1], &page_not_found);
@@ -650,6 +736,7 @@ void ContextWithMemTrace::PageLookupStub(CodeBlockRef block) {
         // TODO
     };
     WrapContext<4>(wrap);
+    __ FinalizeCode();
     auto stub_size = __ GetBuffer()->GetSizeInBytes();
     auto buffer = block->AllocCodeBuffer(0);
     block->FlushCodeBuffer(buffer, static_cast<u32>(stub_size));
@@ -659,8 +746,8 @@ void ContextWithMemTrace::PageLookupStub(CodeBlockRef block) {
 }
 
 void ContextWithMemTrace::CheckReadSpec(Register pte_reg, Register offset_reg) {
-    auto label_skip = Label();
-    auto label_hook = cursor_.label_holder_->GetSpecLabel();
+    auto *label_skip = Label();
+    auto *label_hook = cursor_.label_holder_->GetSpecLabel();
     __ Tbz(pte_reg, READ_SPEC_BITS, label_skip);
     // go hook
     PushX(lr);
@@ -670,8 +757,8 @@ void ContextWithMemTrace::CheckReadSpec(Register pte_reg, Register offset_reg) {
 }
 
 void ContextWithMemTrace::CheckWriteSpec(Register pte_reg, Register offset_reg) {
-    auto label_skip = Label();
-    auto label_hook = cursor_.label_holder_->GetSpecLabel();
+    auto *label_skip = Label();
+    auto *label_hook = cursor_.label_holder_->GetSpecLabel();
     __ Tbz(pte_reg, WRITE_SPEC_BITS, label_skip);
     // go hook
     PushX(lr);

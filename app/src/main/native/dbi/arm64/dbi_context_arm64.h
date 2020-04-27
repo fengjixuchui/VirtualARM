@@ -27,6 +27,7 @@ namespace DBI::A64 {
 #define CTX_TLS_SLOT 7
 #define TMP0 x17
 #define TMP1 x16
+#define LR x30
 #define HOST_TLS ({ void** __val; __asm__("mrs %0, tpidr_el0" : "=r"(__val)); __val; })
 #define HOST_STACK_SIZE (1U << 20)
 
@@ -85,15 +86,19 @@ namespace DBI::A64 {
 
         Label *Label();
 
-        template<u8 temp_count>
+        template<u8 temp_count, bool protect_tmp = true>
         void WrapContext(std::function<void(std::array<Register, temp_count>)> wrap,
                          std::initializer_list<Register> effect_regs = {}) {
             auto temp_regs = GetTmpRegisters<temp_count>(effect_regs);
-            LoadContext();
-            PushX<temp_count>(temp_regs);
+            LoadContext(protect_tmp);
+            if (protect_tmp) {
+                PushX<temp_count>(temp_regs);
+            }
             wrap(temp_regs);
-            PopX<temp_count>(temp_regs);
-            ClearContext();
+            if (protect_tmp) {
+                PopX<temp_count>(temp_regs);
+                ClearContext();
+            }
         }
 
         template<u8 temp_count>
@@ -121,7 +126,7 @@ namespace DBI::A64 {
             return temps;
         }
 
-        virtual void LoadContext() {};
+        virtual void LoadContext(bool protect_tmp = true) {};
 
         virtual void ClearContext() {};
 
@@ -179,6 +184,10 @@ namespace DBI::A64 {
 
         void LoadFromContext(Register target, VAddr offset);
 
+        void PushSp(Register &tmp, u32 offset = OFFSET_CTX_A64_SP);
+
+        void PopSp(Register &tmp, u32 offset = OFFSET_CTX_A64_SP);
+
         VAddr GetCurPc() const;
 
         void SetCurPc(VAddr cur_pc);
@@ -206,8 +215,6 @@ namespace DBI::A64 {
         virtual void RestoreContextFull(bool protect_lr = false);
         virtual void SaveContextCallerSaved(bool protect_lr = false);
         virtual void RestoreContextCallerSaved(bool protect_lr = false);
-        virtual void PrepareHostStack();
-        virtual void PrepareGuestStack();
         virtual void CheckPCAndDispatch();
 
         // brunch
@@ -253,7 +260,7 @@ namespace DBI::A64 {
 
     class ContextNoMemTrace : public Context {
     public:
-        void LoadContext() override;
+        void LoadContext(bool protect_tmp) override;
 
         void ClearContext() override;
 

@@ -50,31 +50,31 @@ Label *LabelHolder::GetMapAddressLabel() {
 
 void LabelHolder::BindDispatcherTrampoline(VAddr addr) {
     assert(dest_buffer_start_);
-    ptrdiff_t offset = dest_buffer_start_ - addr;
+    ptrdiff_t offset = addr - dest_buffer_start_;
     __ BindToOffset(&dispatcher_label_, offset);
 }
 
 void LabelHolder::BindPageLookupTrampoline(VAddr addr) {
     assert(dest_buffer_start_);
-    ptrdiff_t offset = dest_buffer_start_ - addr;
+    ptrdiff_t offset = addr - dest_buffer_start_;
     __ BindToOffset(&page_lookup_label_, offset);
 }
 
 void LabelHolder::BindContextSwitchTrampoline(VAddr addr) {
     assert(dest_buffer_start_);
-    ptrdiff_t offset = dest_buffer_start_ - addr ;
+    ptrdiff_t offset = addr - dest_buffer_start_ ;
     __ BindToOffset(&context_switch_label_, offset);
 }
 
 void LabelHolder::BindSpecTrampoline(VAddr addr) {
     assert(dest_buffer_start_);
-    ptrdiff_t offset = dest_buffer_start_ - addr;
+    ptrdiff_t offset = addr - dest_buffer_start_;
     __ BindToOffset(&spec_label_, offset);
 }
 
 void LabelHolder::BindMapAddress(VAddr addr) {
     assert(dest_buffer_start_);
-    ptrdiff_t offset = dest_buffer_start_ - addr;
+    ptrdiff_t offset = addr - dest_buffer_start_;
     __ BindToOffset(&map_address_label_, offset);
 }
 
@@ -185,9 +185,9 @@ void Context::CheckSuspend(Register tmp) {
     auto *label_skip = Label();
     __ Ldr(tmp, MemOperand(reg_ctx_, OFFSET_CTX_A64_SUSPEND_ADDR));
     __ Cbz(tmp, label_skip);
-    PushX(lr);
+    PushX(LR);
     __ Bl(cursor_.label_holder_->GetContextSwitchLabel());
-    PopX(lr);
+    PopX(LR);
     __ Bind(label_skip);
 }
 
@@ -272,9 +272,9 @@ void Context::FindForwardTarget(u8 reg_target) {
         __ Bind(miss_target);
         __ Str(rt, MemOperand(reg_ctx_, OFFSET_CTX_A64_FORWARD));
         PopX<2>(tmp);
-        PushX(lr);
+        PushX(LR);
         __ Bl(gen_code);
-        PopX(lr);
+        PopX(LR);
         __ Ldr(rt, MemOperand(reg_ctx_, OFFSET_CTX_A64_FORWARD));
         __ Bind(label_end);
     };
@@ -310,11 +310,11 @@ void Context::SaveContextFull(bool protect_lr) {
         // XRegs
         for (int i = 0; i < 30; i += 2) {
             if (i == reg_ctx_.GetCode()) {
-                __ Str(XRegister::GetXRegFromCode(i),
-                       MemOperand(reg_ctx_, 8 * i));
-            } else if (i + 1 == reg_ctx_.GetCode()) {
                 __ Str(XRegister::GetXRegFromCode(i + 1),
                        MemOperand(reg_ctx_, 8 * (i + 1)));
+            } else if (i + 1 == reg_ctx_.GetCode()) {
+                __ Str(XRegister::GetXRegFromCode(i),
+                       MemOperand(reg_ctx_, 8 * i));
             } else {
                 __ Stp(XRegister::GetXRegFromCode(i), XRegister::GetXRegFromCode(i + 1),
                        MemOperand(reg_ctx_, 8 * i));
@@ -325,14 +325,16 @@ void Context::SaveContextFull(bool protect_lr) {
             __ Str(x30, MemOperand(reg_ctx_, protect_lr ? 8 * 30 : OFFSET_CTX_A64_TMP_LR));
         }
         // Sysregs
-        __ Mrs(tmp[0], NZCV);
+        __ Mrs(tmp[0].W(), NZCV);
         __ Str(tmp[0].W(), MemOperand(reg_ctx_, OFFSET_CTX_A64_PSTATE));
-        __ Mrs(tmp[0], FPCR);
+        __ Mrs(tmp[0].W(), FPCR);
         __ Str(tmp[0].W(), MemOperand(reg_ctx_, OFFSET_CTX_A64_FPCR));
-        __ Mrs(tmp[0], FPSR);
+        __ Mrs(tmp[0].W(), FPSR);
         __ Str(tmp[0].W(), MemOperand(reg_ctx_, OFFSET_CTX_A64_FPSR));
         // Sp
-        __ Str(sp, MemOperand(reg_ctx_, OFFSET_CTX_A64_SP));
+        PushSp(tmp[0]);
+        // Host SP
+        PopSp(tmp[0], OFFSET_CTX_A64_HOST_SP);
         // Protect Pc
         // Pc could be changed by host
         // dispatch if changed
@@ -369,13 +371,99 @@ void Context::RestoreContextFull(bool protect_lr) {
         }
         // Sysregs
         __ Ldr(tmp[0].W(), MemOperand(reg_ctx_, OFFSET_CTX_A64_PSTATE));
-        __ Msr(NZCV, tmp[0]);
+        __ Msr(NZCV, tmp[0].W());
         __ Ldr(tmp[0].W(), MemOperand(reg_ctx_, OFFSET_CTX_A64_FPCR));
-        __ Msr(FPCR, tmp[0]);
+        __ Msr(FPCR, tmp[0].W());
         __ Ldr(tmp[0].W(), MemOperand(reg_ctx_, OFFSET_CTX_A64_FPSR));
-        __ Msr(FPSR, tmp[0]);
+        __ Msr(FPSR, tmp[0].W());
+        // Host Sp
+        PushSp(tmp[0], OFFSET_CTX_A64_HOST_SP);
+        // Guest SP
+        PopSp(tmp[0]);
+        // VRegs
+        __ Add(tmp[0], reg_ctx_, OFFSET_CTX_A64_VEC_REG);
+        for (int i = 0; i < 32; i += 2) {
+            __ Ldp(VRegister::GetVRegFromCode(i), VRegister::GetVRegFromCode(i + 1),
+                   MemOperand(tmp[0], 16 * i));
+        }
+    };
+    WrapContext<1, false>(wrap);
+}
+
+void Context::SaveContextCallerSaved(bool protect_lr) {
+    auto wrap = [this, protect_lr](std::array<Register, 1> tmp) -> void {
+        // XRegs
+        // x0 - x18
+        for (int i = 0; i < 19; i += 2) {
+            if (i == reg_ctx_.GetCode()) {
+                __ Str(XRegister::GetXRegFromCode(i + 1),
+                       MemOperand(reg_ctx_, 8 * (i + 1)));
+            } else if (i + 1 == reg_ctx_.GetCode()) {
+                __ Str(XRegister::GetXRegFromCode(i),
+                       MemOperand(reg_ctx_, 8 * i));
+            } else {
+                __ Stp(XRegister::GetXRegFromCode(i), XRegister::GetXRegFromCode(i + 1),
+                       MemOperand(reg_ctx_, 8 * i));
+            }
+        }
+        // lr
+        if (reg_ctx_.GetCode() != 30) {
+            __ Str(LR, MemOperand(reg_ctx_, protect_lr ? 8 * 30 : OFFSET_CTX_A64_TMP_LR));
+        }
+        // Sysregs
+        __ Mrs(tmp[0].W(), NZCV);
+        __ Str(tmp[0].W(), MemOperand(reg_ctx_, OFFSET_CTX_A64_PSTATE));
+        __ Mrs(tmp[0].W(), FPCR);
+        __ Str(tmp[0].W(), MemOperand(reg_ctx_, OFFSET_CTX_A64_FPCR));
+        __ Mrs(tmp[0].W(), FPSR);
+        __ Str(tmp[0].W(), MemOperand(reg_ctx_, OFFSET_CTX_A64_FPSR));
         // Sp
-        __ Ldr(sp, MemOperand(reg_ctx_, OFFSET_CTX_A64_SP));
+        PushSp(tmp[0]);
+        // Host SP
+        PopSp(tmp[0], OFFSET_CTX_A64_HOST_SP);
+        // Pc
+        __ Mov(tmp[0], cur_pc_);
+        __ Str(tmp[0], MemOperand(reg_ctx_, OFFSET_CTX_A64_PC));
+        // VRegs
+        __ Add(tmp[0], reg_ctx_, OFFSET_CTX_A64_VEC_REG);
+        for (int i = 0; i < 32; i += 2) {
+            __ Stp(VRegister::GetVRegFromCode(i), VRegister::GetVRegFromCode(i + 1),
+                   MemOperand(tmp[0], 16 * i));
+        }
+    };
+    WrapContext<1>(wrap);
+}
+
+void Context::RestoreContextCallerSaved(bool protect_lr) {
+    auto wrap = [this, protect_lr](std::array<Register, 1> tmp) -> void {
+        // XRegs
+        for (int i = 0; i < 19; i += 2) {
+            if (i == reg_ctx_.GetCode()) {
+                __ Ldr(XRegister::GetXRegFromCode(i + 1),
+                       MemOperand(reg_ctx_, 8 * (i + 1)));
+            } else if (i + 1 == reg_ctx_.GetCode()) {
+                __ Ldr(XRegister::GetXRegFromCode(i),
+                       MemOperand(reg_ctx_, 8 * i));
+            } else {
+                __ Ldp(XRegister::GetXRegFromCode(i), XRegister::GetXRegFromCode(i + 1),
+                       MemOperand(reg_ctx_, 8 * i));
+            }
+        }
+        // lr
+        if (reg_ctx_.GetCode() != 30) {
+            __ Ldr(x30, MemOperand(reg_ctx_, protect_lr ? 8 * 30 : OFFSET_CTX_A64_TMP_LR));
+        }
+        // Sysregs
+        __ Ldr(tmp[0].W(), MemOperand(reg_ctx_, OFFSET_CTX_A64_PSTATE));
+        __ Msr(NZCV, tmp[0].W());
+        __ Ldr(tmp[0].W(), MemOperand(reg_ctx_, OFFSET_CTX_A64_FPCR));
+        __ Msr(FPCR, tmp[0].W());
+        __ Ldr(tmp[0].W(), MemOperand(reg_ctx_, OFFSET_CTX_A64_FPSR));
+        __ Msr(FPSR, tmp[0].W());
+        // Host Sp
+        PushSp(tmp[0], OFFSET_CTX_A64_HOST_SP);
+        // Guest SP
+        PopSp(tmp[0]);
         // VRegs
         __ Add(tmp[0], reg_ctx_, OFFSET_CTX_A64_VEC_REG);
         for (int i = 0; i < 32; i += 2) {
@@ -386,95 +474,15 @@ void Context::RestoreContextFull(bool protect_lr) {
     WrapContext<1>(wrap);
 }
 
-void Context::SaveContextCallerSaved(bool protect_lr) {
-    auto wrap = [this, protect_lr](std::array<Register, 1> tmp) -> void {
-        // XRegs
-        // x0 - x18
-        for (int i = 0; i < 19; i += 2) {
-            if (i == reg_ctx_.GetCode()) {
-                __ Str(XRegister::GetXRegFromCode(i),
-                       MemOperand(reg_ctx_, 16 * i));
-            } else if (i + 1 == reg_ctx_.GetCode()) {
-                __ Str(XRegister::GetXRegFromCode(i + 1),
-                       MemOperand(reg_ctx_, 16 * (i + 1)));
-            } else {
-                __ Stp(XRegister::GetXRegFromCode(i), XRegister::GetXRegFromCode(i + 1),
-                       MemOperand(reg_ctx_, 16 * i));
-            }
-        }
-        // lr
-        if (reg_ctx_.GetCode() != 30) {
-            __ Str(x30, MemOperand(reg_ctx_, protect_lr ? 8 * 30 : OFFSET_CTX_A64_TMP_LR));
-        }
-        // Sysregs
-        __ Mrs(tmp[0], NZCV);
-        __ Str(tmp[0].W(), MemOperand(reg_ctx_, OFFSET_CTX_A64_PSTATE));
-        __ Mrs(tmp[0], FPCR);
-        __ Str(tmp[0].W(), MemOperand(reg_ctx_, OFFSET_CTX_A64_FPCR));
-        __ Mrs(tmp[0], FPSR);
-        __ Str(tmp[0].W(), MemOperand(reg_ctx_, OFFSET_CTX_A64_FPSR));
-        // Sp
-        __ Str(sp, MemOperand(reg_ctx_, OFFSET_CTX_A64_SP));
-        // Pc
-        __ Mov(tmp[0], cur_pc_);
-        __ Str(tmp[0], MemOperand(reg_ctx_, OFFSET_CTX_A64_PC));
-        // VRegs
-        __ Add(tmp[0], reg_ctx_, OFFSET_CTX_A64_VEC_REG);
-        for (int i = 0; i < 32; i += 2) {
-            __ Stp(VRegister::GetVRegFromCode(i), VRegister::GetVRegFromCode(i + 1),
-                   MemOperand(tmp[0], 32 * i));
-        }
-    };
-    WrapContext<1>(wrap);
-}
-
-void Context::RestoreContextCallerSaved(bool protect_lr) {
-    auto wrap = [this, protect_lr](std::array<Register, 1> tmp) -> void {
-        // XRegs
-        for (int i = 0; i < 31; i += 2) {
-            if (i == reg_ctx_.GetCode()) {
-                __ Ldr(XRegister::GetXRegFromCode(i),
-                       MemOperand(reg_ctx_, 16 * i));
-            } else if (i + 1 == reg_ctx_.GetCode()) {
-                __ Ldr(XRegister::GetXRegFromCode(i + 1),
-                       MemOperand(reg_ctx_, 16 * (i + 1)));
-            } else {
-                __ Ldp(XRegister::GetXRegFromCode(i), XRegister::GetXRegFromCode(i + 1),
-                       MemOperand(reg_ctx_, 16 * i));
-            }
-        }
-        // lr
-        if (reg_ctx_.GetCode() != 30) {
-            __ Ldr(x30, MemOperand(reg_ctx_, protect_lr ? 8 * 30 : OFFSET_CTX_A64_TMP_LR));
-        }
-        // Sysregs
-        __ Ldr(tmp[0].W(), MemOperand(reg_ctx_, OFFSET_CTX_A64_PSTATE));
-        __ Msr(NZCV, tmp[0]);
-        __ Ldr(tmp[0].W(), MemOperand(reg_ctx_, OFFSET_CTX_A64_FPCR));
-        __ Msr(FPCR, tmp[0]);
-        __ Ldr(tmp[0].W(), MemOperand(reg_ctx_, OFFSET_CTX_A64_FPSR));
-        __ Msr(FPSR, tmp[0]);
-        // Sp
-        __ Ldr(sp, MemOperand(reg_ctx_, OFFSET_CTX_A64_SP));
-        // VRegs
-        __ Add(tmp[0], reg_ctx_, OFFSET_CTX_A64_VEC_REG);
-        for (int i = 0; i < 32; i += 2) {
-            __ Ldp(VRegister::GetVRegFromCode(i), VRegister::GetVRegFromCode(i + 1),
-                   MemOperand(tmp[0], 32 * i));
-        }
-    };
-    WrapContext<1>(wrap);
-}
-
 void Context::CallSvc(u32 svc_num) {
     auto wrap = [this, svc_num](std::array<Register, 1> tmp) -> void {
         __ Mov(tmp[0], svc_num);
         __ Str(tmp[0], MemOperand(reg_ctx_, OFFSET_CTX_A64_SVC_NUM));
         PopX<1>(tmp);
-        PushX(lr);
+        PushX(LR);
         __ Bl(cursor_.label_holder_->GetContextSwitchLabel());
         LoadContext();
-        PopX(lr);
+        PopX(LR);
     };
     WrapContext<1>(wrap);
 }
@@ -482,13 +490,8 @@ void Context::CallSvc(u32 svc_num) {
 void Context::DispatherStub(CodeBlockRef block) {
     __ Reset();
     SaveContextCallerSaved();
-    PrepareHostStack();
-    LoadContext();
-    __ Push(reg_ctx_);
     __ Mov(x0, reinterpret_cast<VAddr>(CodeCacheDispatcherTrampoline));
     __ Blr(x0);
-    __ Pop(reg_ctx_);
-    PrepareGuestStack();
     RestoreContextCallerSaved();
     __ Ret();
     __ FinalizeCode();
@@ -504,13 +507,8 @@ void Context::ContextSwitchStub(CodeBlockRef block) {
     SetCodeCachePosition(0);
     __ Reset();
     SaveContextFull();
-    PrepareHostStack();
-    LoadContext();
-    __ Push(reg_ctx_);
     __ Mov(x0, reinterpret_cast<VAddr>(ContextSwitchTrampoline));
     __ Blr(x0);
-    __ Pop(reg_ctx_);
-    PrepareGuestStack();
     RestoreContextFull();
     CheckPCAndDispatch();
     __ Ret();
@@ -528,13 +526,8 @@ void Context::ContextSwitchStub(CodeBlockRef block) {
 void Context::SpecStub(CodeBlockRef block) {
     __ Reset();
     SaveContextCallerSaved();
-    PrepareHostStack();
-    LoadContext();
-    __ Push(reg_ctx_);
     __ Mov(x0, reinterpret_cast<VAddr>(SpecTrampoline));
     __ Blr(x0);
-    __ Pop(reg_ctx_);
-    PrepareGuestStack();
     RestoreContextCallerSaved();
     __ Ret();
     __ FinalizeCode();
@@ -544,14 +537,6 @@ void Context::SpecStub(CodeBlockRef block) {
     std::memcpy(reinterpret_cast<void *>(block->GetBufferStart(buffer)), __ GetBuffer()->GetStartAddress<void *>(), stub_size);
     ClearCachePlatform(block->GetBufferStart(buffer), stub_size);
     __ Reset();
-}
-
-void Context::PrepareHostStack() {
-    __ Ldr(sp, MemOperand(reg_ctx_, OFFSET_CTX_A64_HOST_SP));
-}
-
-void Context::PrepareGuestStack() {
-    __ Str(sp, MemOperand(reg_ctx_, OFFSET_CTX_A64_HOST_SP));
 }
 
 void Context::CheckPCAndDispatch() {
@@ -568,7 +553,7 @@ void Context::CheckPCAndDispatch() {
             PopX(tmp[0]);
         }
         // restore real lr, because will never come back
-        PopX(lr);
+        PopX(LR);
         __ Br(reg_forward_);
         __ Bind(not_changed);
     };
@@ -581,6 +566,16 @@ void Context::ModifyCodeStart(Context::ModifyCodeType type) {
 
 void Context::ModifyCodeEnd() {
 
+}
+
+void Context::PushSp(Register &tmp, u32 offset) {
+    __ Mov(tmp, sp);
+    __ Str(tmp, MemOperand(reg_ctx_, offset));
+}
+
+void Context::PopSp(Register &tmp, u32 offset) {
+    __ Ldr(tmp, MemOperand(reg_ctx_, offset));
+    __ Mov(sp, tmp);
 }
 
 ContextNoMemTrace::ContextNoMemTrace() : Context(TMP1, TMP0) {
@@ -605,16 +600,20 @@ void ContextNoMemTrace::PostDispatch() {
     __ Pop(TMP0, TMP1);
 }
 
-void ContextNoMemTrace::LoadContext() {
-    __ Push(reg_ctx_);
+void ContextNoMemTrace::LoadContext(bool protect_tmp) {
+    if (protect_tmp) {
+        __ Push(reg_ctx_);
+    }
     __ Mrs(reg_ctx_, TPIDR_EL0);
     __ Ldr(reg_ctx_, MemOperand(reg_ctx_, CTX_TLS_SLOT * 8));
-    // save tmp0, tmp1
-    __ Str(TMP0, MemOperand(reg_ctx_, OFFSET_CTX_A64_CPU_REG + TMP0.GetCode() * 8));
-    __ Pop(TMP0);
-    __ Str(TMP0, MemOperand(reg_ctx_, OFFSET_CTX_A64_CPU_REG + reg_ctx_.GetCode() * 8));
-    // restore tmp0
-    __ Ldr(TMP0, MemOperand(reg_ctx_, OFFSET_CTX_A64_CPU_REG + TMP0.GetCode() * 8));
+    if (protect_tmp) {
+        // save tmp0, tmp1
+        __ Str(TMP0, MemOperand(reg_ctx_, OFFSET_CTX_A64_CPU_REG + TMP0.GetCode() * 8));
+        __ Pop(TMP0);
+        __ Str(TMP0, MemOperand(reg_ctx_, OFFSET_CTX_A64_CPU_REG + reg_ctx_.GetCode() * 8));
+        // restore tmp0
+        __ Ldr(TMP0, MemOperand(reg_ctx_, OFFSET_CTX_A64_CPU_REG + TMP0.GetCode() * 8));
+    }
 }
 
 void ContextNoMemTrace::ClearContext() {
@@ -688,10 +687,10 @@ void ContextWithMemTrace::LookupTLB(u8 reg_addr) {
         // miss cache
         __ Str(tmp2, MemOperand(reg_ctx_, OFFSET_CTX_A64_QUERY_PAGE));
         PopX<3>(tmp);
-        PushX(lr);
+        PushX(LR);
         __ Bl(label_lookup_page_table);
         LoadContext();
-        PopX(lr);
+        PopX(LR);
         __ Ldr(rt, MemOperand(reg_ctx_, OFFSET_CTX_A64_QUERY_PAGE));
         __ B(label_end);
         // hit, load pte
@@ -750,9 +749,9 @@ void ContextWithMemTrace::CheckReadSpec(Register pte_reg, Register offset_reg) {
     auto *label_hook = cursor_.label_holder_->GetSpecLabel();
     __ Tbz(pte_reg, READ_SPEC_BITS, label_skip);
     // go hook
-    PushX(lr);
+    PushX(LR);
     __ Bl(label_hook);
-    PopX(lr);
+    PopX(LR);
     __ Bind(label_skip);
 }
 
@@ -761,9 +760,9 @@ void ContextWithMemTrace::CheckWriteSpec(Register pte_reg, Register offset_reg) 
     auto *label_hook = cursor_.label_holder_->GetSpecLabel();
     __ Tbz(pte_reg, WRITE_SPEC_BITS, label_skip);
     // go hook
-    PushX(lr);
+    PushX(LR);
     __ Bl(label_hook);
-    PopX(lr);
+    PopX(LR);
     __ Bind(label_skip);
 }
 
